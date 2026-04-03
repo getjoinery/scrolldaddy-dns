@@ -45,7 +45,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /device/{uid}/seen", h.requireAPIKey(h.deviceSeen))
 	mux.HandleFunc("GET /stats", localhostOnly(h.stats))
 	mux.HandleFunc("POST /reload", h.requireAPIKey(h.reload))
-	mux.HandleFunc("GET /test", localhostOnly(h.test))
+	mux.HandleFunc("GET /test", h.requireAPIKey(h.test))
 }
 
 // doHGet handles GET /resolve/{uid}?dns=<base64url>
