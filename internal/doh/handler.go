@@ -44,7 +44,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /health", h.health)
 	mux.HandleFunc("GET /device/{uid}/seen", h.requireAPIKey(h.deviceSeen))
 	mux.HandleFunc("GET /stats", localhostOnly(h.stats))
-	mux.HandleFunc("POST /reload", localhostOnly(h.reload))
+	mux.HandleFunc("POST /reload", h.requireAPIKey(h.reload))
 	mux.HandleFunc("GET /test", localhostOnly(h.test))
 }
 
