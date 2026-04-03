@@ -322,6 +322,19 @@ func (db *DB) LoadBlocklistDomains() (map[string]map[string]bool, error) {
 	return result, rows.Err()
 }
 
+// GetBlocklistVersion returns the current scrolldaddy_blocklist_version from stg_settings.
+// Returns an empty string if the setting does not exist or the query fails.
+func (db *DB) GetBlocklistVersion() string {
+	var version string
+	err := db.conn.QueryRow(
+		`SELECT stg_value FROM stg_settings WHERE stg_name = 'scrolldaddy_blocklist_version' LIMIT 1`,
+	).Scan(&version)
+	if err != nil {
+		return ""
+	}
+	return version
+}
+
 // ParseScheduleDays parses the cdp_schedule_days JSON field (e.g. ["mon","tue","wed"]).
 func ParseScheduleDays(raw sql.NullString) []string {
 	if !raw.Valid || raw.String == "" {

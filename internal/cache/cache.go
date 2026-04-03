@@ -52,13 +52,14 @@ type CacheStats struct {
 type Cache struct {
 	mu sync.RWMutex
 
-	devices          map[string]*DeviceInfo    // resolver_uid → DeviceInfo
-	profiles         map[int64]*ProfileInfo    // profile_id → ProfileInfo
+	devices          map[string]*DeviceInfo     // resolver_uid → DeviceInfo
+	profiles         map[int64]*ProfileInfo     // profile_id → ProfileInfo
 	blocklistDomains map[string]map[string]bool // category_key → domain set (shared across profiles)
 
-	lastLightReload time.Time
-	lastFullReload  time.Time
-	startTime       time.Time
+	lastLightReload      time.Time
+	lastFullReload       time.Time
+	startTime            time.Time
+	lastBlocklistVersion string // last scrolldaddy_blocklist_version seen
 
 	lsMu     sync.RWMutex
 	lastSeen map[string]time.Time // resolver_uid → last query time
@@ -269,7 +270,19 @@ func (c *Cache) LightReload(database *db.DB) error {
 }
 
 // FullReload reloads blocklist domains from the DB.
+// Skips the expensive table scan if the blocklist version in stg_settings is unchanged.
 func (c *Cache) FullReload(database *db.DB) error {
+	currentVersion := database.GetBlocklistVersion()
+
+	c.mu.RLock()
+	lastVersion := c.lastBlocklistVersion
+	c.mu.RUnlock()
+
+	if currentVersion != "" && currentVersion == lastVersion {
+		logger.Debug("blocklist data unchanged (version=%q), skipping full reload", currentVersion)
+		return nil
+	}
+
 	newDomains, err := database.LoadBlocklistDomains()
 	if err != nil {
 		return fmt.Errorf("loading blocklist domains: %w", err)
@@ -283,6 +296,7 @@ func (c *Cache) FullReload(database *db.DB) error {
 	c.mu.Lock()
 	c.blocklistDomains = newDomains
 	c.lastFullReload = time.Now()
+	c.lastBlocklistVersion = currentVersion
 	c.mu.Unlock()
 
 	logger.Info("full reload complete: %d blocklist domains across %d categories", totalDomains, len(newDomains))
