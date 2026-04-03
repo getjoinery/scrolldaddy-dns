@@ -59,6 +59,9 @@ type Cache struct {
 	lastLightReload time.Time
 	lastFullReload  time.Time
 	startTime       time.Time
+
+	lsMu     sync.RWMutex
+	lastSeen map[string]time.Time // resolver_uid → last query time
 }
 
 // New creates an empty cache.
@@ -68,7 +71,24 @@ func New() *Cache {
 		profiles:         map[int64]*ProfileInfo{},
 		blocklistDomains: map[string]map[string]bool{},
 		startTime:        time.Now(),
+		lastSeen:         map[string]time.Time{},
 	}
+}
+
+// RecordQuery records the current time as the last-seen time for the given resolver UID.
+func (c *Cache) RecordQuery(uid string) {
+	c.lsMu.Lock()
+	c.lastSeen[uid] = time.Now()
+	c.lsMu.Unlock()
+}
+
+// GetLastSeen returns the last time a query was seen for the given resolver UID.
+// Returns zero time and false if the UID has never been seen since startup.
+func (c *Cache) GetLastSeen(uid string) (time.Time, bool) {
+	c.lsMu.RLock()
+	t, ok := c.lastSeen[uid]
+	c.lsMu.RUnlock()
+	return t, ok
 }
 
 // GetDevice returns the DeviceInfo for a resolver UID, or nil if not found.
@@ -129,6 +149,11 @@ func (c *Cache) LightReload(database *db.DB) error {
 		return fmt.Errorf("loading filters: %w", err)
 	}
 
+	serviceMap, err := database.LoadServices()
+	if err != nil {
+		return fmt.Errorf("loading services: %w", err)
+	}
+
 	ruleMap, err := database.LoadRules()
 	if err != nil {
 		return fmt.Errorf("loading rules: %w", err)
@@ -160,6 +185,15 @@ func (c *Cache) LightReload(database *db.DB) error {
 					pi.CustomBlocked[domain] = true
 				} else {
 					pi.CustomAllowed[domain] = true
+				}
+			}
+		}
+		if services, ok := serviceMap[profileID]; ok {
+			for _, svcKey := range services {
+				if domains, ok := ServiceDomains[svcKey]; ok {
+					for _, domain := range domains {
+						pi.CustomBlocked[strings.ToLower(domain)] = true
+					}
 				}
 			}
 		}

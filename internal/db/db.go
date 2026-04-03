@@ -268,6 +268,35 @@ func (db *DB) LoadRules() (map[int64][]*RuleRow, error) {
 	return result, rows.Err()
 }
 
+// LoadServices loads all active service assignments, keyed by profile ID.
+// Note: cds_cdp_ctldprofile_id is varchar in the schema but stores integer values.
+func (db *DB) LoadServices() (map[int64][]string, error) {
+	const query = `
+		SELECT
+			cds_cdp_ctldprofile_id::bigint AS profile_id,
+			cds_service_pk AS service_key
+		FROM cds_ctldservices
+		WHERE cds_is_active = 1
+		  AND cds_cdp_ctldprofile_id ~ '^[0-9]+$'
+	`
+	rows, err := db.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := map[int64][]string{}
+	for rows.Next() {
+		var profileID int64
+		var serviceKey string
+		if err := rows.Scan(&profileID, &serviceKey); err != nil {
+			return nil, err
+		}
+		result[profileID] = append(result[profileID], serviceKey)
+	}
+	return result, rows.Err()
+}
+
 // LoadBlocklistDomains streams all blocklist domains from the DB.
 // Returns map[categoryKey]map[domain]bool.
 func (db *DB) LoadBlocklistDomains() (map[string]map[string]bool, error) {

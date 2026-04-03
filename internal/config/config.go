@@ -27,6 +27,8 @@ type Config struct {
 
 	LogLevel string
 	LogFile  string
+
+	APIKey string
 }
 
 func Load() (*Config, error) {
@@ -47,6 +49,7 @@ func Load() (*Config, error) {
 		BlocklistReloadInterval: getEnvInt("SCD_BLOCKLIST_RELOAD_INTERVAL", 3600),
 		LogLevel:                getEnv("SCD_LOG_LEVEL", "info"),
 		LogFile:                 getEnv("SCD_LOG_FILE", "stdout"),
+		APIKey:                  getEnv("SCD_API_KEY", ""),
 	}
 
 	if cfg.DBName == "" {

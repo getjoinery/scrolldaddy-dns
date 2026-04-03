@@ -19,19 +19,21 @@ import (
 
 // Handler holds all state needed by the DoH HTTP handlers.
 type Handler struct {
-	resolver     *resolver.Resolver
-	cache        *cache.Cache
-	database     *db.DB
+	resolver      *resolver.Resolver
+	cache         *cache.Cache
+	database      *db.DB
 	reloadTrigger chan struct{}
+	apiKey        string
 }
 
 // New creates a Handler.
-func New(res *resolver.Resolver, c *cache.Cache, database *db.DB, reloadTrigger chan struct{}) *Handler {
+func New(res *resolver.Resolver, c *cache.Cache, database *db.DB, reloadTrigger chan struct{}, apiKey string) *Handler {
 	return &Handler{
 		resolver:      res,
 		cache:         c,
 		database:      database,
 		reloadTrigger: reloadTrigger,
+		apiKey:        apiKey,
 	}
 }
 
@@ -40,6 +42,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /resolve/{uid}", h.doHGet)
 	mux.HandleFunc("POST /resolve/{uid}", h.doHPost)
 	mux.HandleFunc("GET /health", h.health)
+	mux.HandleFunc("GET /device/{uid}/seen", h.requireAPIKey(h.deviceSeen))
 	mux.HandleFunc("GET /stats", localhostOnly(h.stats))
 	mux.HandleFunc("POST /reload", localhostOnly(h.reload))
 	mux.HandleFunc("GET /test", localhostOnly(h.test))
@@ -97,6 +100,7 @@ func (h *Handler) handleDNSQuery(w http.ResponseWriter, uid string, data []byte)
 		return
 	}
 
+	h.cache.RecordQuery(uid)
 	result := h.resolver.Resolve(uid, &query)
 
 	packed, err := result.DNSResponse.Pack()
@@ -198,6 +202,50 @@ func (h *Handler) test(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// deviceSeen returns the last-seen time for a resolver UID.
+func (h *Handler) deviceSeen(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if !isValidUID(uid) {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if t, ok := h.cache.GetLastSeen(uid); ok {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"uid":       uid,
+			"seen":      true,
+			"last_seen": t.UTC().Format(time.RFC3339),
+		})
+	} else {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"uid":       uid,
+			"seen":      false,
+			"last_seen": nil,
+		})
+	}
+}
+
+// requireAPIKey is middleware that checks for a valid API key if one is configured.
+// The key may be passed as the X-API-Key header or the api_key query parameter.
+// If no API key is configured on the server, all requests are allowed through.
+func (h *Handler) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.apiKey != "" {
+			key := r.Header.Get("X-API-Key")
+			if key == "" {
+				key = r.URL.Query().Get("api_key")
+			}
+			if key != h.apiKey {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
+	}
 }
 
 // localhostOnly is middleware that restricts a handler to localhost connections.

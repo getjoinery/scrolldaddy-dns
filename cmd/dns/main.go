@@ -77,7 +77,7 @@ func main() {
 
 	// 7. Start DoH server
 	errCh := make(chan error, 2)
-	handler := doh.New(res, c, database, reloadTrigger)
+	handler := doh.New(res, c, database, reloadTrigger, cfg.APIKey)
 	go func() {
 		if err := doh.Server(cfg.DoHPort, handler); err != nil {
 			errCh <- fmt.Errorf("DoH server: %w", err)
