@@ -8,5 +8,6 @@
     "dir": "/var/log/scrolldaddy/queries",
     "buffer_size": 4096,
     "max_file_size": 2097152
-  }
+  },
+  "fail_mode": "open"
 }

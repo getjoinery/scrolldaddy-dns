@@ -41,6 +41,13 @@ type Config struct {
 type FeatureConfig struct {
 	DNSCache DNSCacheConfig `json:"dns_cache"`
 	QueryLog QueryLogConfig `json:"query_log"`
+	FailMode string         `json:"fail_mode"` // "open" or "closed"
+}
+
+// FailOpen reports whether the service should start in passthrough mode when
+// the database is unavailable, rather than refusing all queries.
+func (fc *FeatureConfig) FailOpen() bool {
+	return fc.FailMode != "closed"
 }
 
 // DNSCacheConfig controls the DNS response cache.
@@ -70,6 +77,7 @@ func DefaultFeatureConfig() *FeatureConfig {
 			BufferSize:  4096,
 			MaxFileSize: 2097152, // 2MB
 		},
+		FailMode: "open",
 	}
 }
 

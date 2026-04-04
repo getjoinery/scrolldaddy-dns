@@ -3,6 +3,7 @@ package resolver
 import (
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -55,6 +56,11 @@ type Resolver struct {
 	queryLog          *querylog.Logger
 	upstreamPrimary   string
 	upstreamSecondary string
+
+	// passthrough is set to true during startup when the cache is not yet
+	// loaded (fail_open mode). All queries are forwarded upstream without
+	// filtering until the cache is ready.
+	passthrough atomic.Bool
 }
 
 // SafeSearch CNAME rewrites keyed by query domain.
@@ -96,6 +102,33 @@ func New(c *cache.Cache, dc *dnscache.Cache, ql *querylog.Logger, primary, secon
 	}
 }
 
+// ForwardDirect forwards a query to upstream without any cache or filtering.
+// Used as a last-resort fallback in panic recovery paths.
+func (r *Resolver) ForwardDirect(query *dns.Msg) *dns.Msg {
+	resp, err := upstream.Forward(query, r.upstreamPrimary, r.upstreamSecondary)
+	if err != nil {
+		return nil
+	}
+	return resp
+}
+
+// SetPassthrough enables or disables passthrough mode. When enabled, all
+// queries are forwarded to upstream without any filtering. Used during
+// startup when the cache is not yet loaded (fail_open mode).
+func (r *Resolver) SetPassthrough(v bool) {
+	r.passthrough.Store(v)
+	if v {
+		logger.Warn("passthrough mode ACTIVE — all queries forwarded unfiltered")
+	} else {
+		logger.Info("passthrough mode disabled — filtering active")
+	}
+}
+
+// InPassthrough reports whether passthrough mode is currently active.
+func (r *Resolver) InPassthrough() bool {
+	return r.passthrough.Load()
+}
+
 // forwardWithCache checks the DNS response cache before forwarding to upstream.
 // Returns the response, whether it was a cache hit, and any error.
 func (r *Resolver) forwardWithCache(query *dns.Msg) (*dns.Msg, bool, error) {
@@ -116,6 +149,24 @@ func (r *Resolver) forwardWithCache(query *dns.Msg) (*dns.Msg, bool, error) {
 
 // Resolve processes a DNS query for the given resolver UID and returns a ResolveResult.
 func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
+	// 0. Passthrough mode: cache not yet loaded (fail_open startup).
+	//    Forward all queries unfiltered until the cache is ready.
+	if r.passthrough.Load() {
+		resp, _, err := r.forwardWithCache(query)
+		if err != nil {
+			return &ResolveResult{
+				DNSResponse: servFail(query),
+				Result:      ResultServFail,
+				Reason:      ReasonUpstreamFailed,
+			}
+		}
+		return &ResolveResult{
+			DNSResponse: resp,
+			Result:      ResultForwarded,
+			Reason:      "passthrough",
+		}
+	}
+
 	// 1. Device lookup
 	device := r.cache.GetDevice(resolverUID)
 	if device == nil {

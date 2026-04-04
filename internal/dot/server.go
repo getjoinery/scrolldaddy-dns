@@ -94,14 +94,11 @@ func handleConn(conn net.Conn, baseDomain string, res *resolver.Resolver, c *cac
 		}
 
 		c.RecordQuery(uid)
-		result := res.Resolve(uid, &query)
 
-		packed, err := result.DNSResponse.Pack()
-		if err != nil {
-			logger.Warn("DoT pack error: %v", err)
+		packed := resolveDoT(res, uid, &query)
+		if packed == nil {
 			return
 		}
-
 		if err := writeTCPMessage(conn, packed); err != nil {
 			return
 		}
@@ -126,6 +123,26 @@ func extractUID(sni, baseDomain string) string {
 		}
 	}
 	return uid
+}
+
+// resolveDoT resolves a single DoT query with panic recovery.
+// Returns the packed response bytes, or nil if the connection should be closed.
+func resolveDoT(res *resolver.Resolver, uid string, query *dns.Msg) []byte {
+	defer func() {}() // ensure deferred recover runs before return
+	var packed []byte
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				logger.Error("panic in DoT handler uid=%s: %v — forwarding upstream", uid, rec)
+				if resp := res.ForwardDirect(query); resp != nil {
+					packed, _ = resp.Pack()
+				}
+			}
+		}()
+		result := res.Resolve(uid, query)
+		packed, _ = result.DNSResponse.Pack()
+	}()
+	return packed
 }
 
 // readTCPMessage reads one DNS message from a TCP connection (2-byte length prefix).

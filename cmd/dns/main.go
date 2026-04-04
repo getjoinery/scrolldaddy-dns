@@ -40,43 +40,14 @@ func main() {
 	logger.Info("starting ScrollDaddy DNS service v%s", version)
 	logger.Info("database: %s@%s:%s/%s", cfg.DBUser, cfg.DBHost, cfg.DBPort, cfg.DBName)
 
-	// 2. Connect to PostgreSQL with retry
-	var database *db.DB
-	for {
-		database, err = db.Connect(cfg.DBHost, cfg.DBPort, cfg.DBName, cfg.DBUser, cfg.DBPassword)
-		if err == nil {
-			break
-		}
-		logger.Error("DB connection failed: %v -- retrying in 5s", err)
-		time.Sleep(5 * time.Second)
-	}
-	defer database.Close()
-	logger.Info("connected to PostgreSQL: %s@%s:%s/%s", cfg.DBUser, cfg.DBHost, cfg.DBPort, cfg.DBName)
-
-	// 3. Validate schema -- refuse to start if required columns are missing
-	if err := database.ValidateSchema(); err != nil {
-		log.Fatalf("FATAL %v", err)
-	}
-	logger.Info("schema validation passed")
-
-	// 4. Create cache and perform initial full load
-	c := cache.New()
-	if err := c.LightReload(database); err != nil {
-		log.Fatalf("FATAL initial light reload failed: %v", err)
-	}
-	if err := c.FullReload(database); err != nil {
-		log.Fatalf("FATAL initial full reload failed: %v", err)
-	}
-	logger.Info("initial cache load complete")
-
-	// 5. Load feature config (dns cache, query logging)
+	// 2. Load feature config (needed early to know fail_mode before DB connect)
 	fc, err := config.LoadFeatureConfig(cfg.ConfigFile)
 	if err != nil {
 		log.Fatalf("FATAL config file: %v", err)
 	}
 	config.MergeEnvOverrides(fc)
 
-	// 5a. Create DNS response cache
+	// 2a. Create DNS response cache
 	var dc *dnscache.Cache
 	if fc.DNSCache.Enabled && fc.DNSCache.MaxSize > 0 {
 		dc = dnscache.New(fc.DNSCache.MaxSize)
@@ -85,7 +56,7 @@ func main() {
 		logger.Info("DNS response cache disabled")
 	}
 
-	// 5b. Create query logger
+	// 2b. Create query logger
 	var ql *querylog.Logger
 	if fc.QueryLog.Enabled && fc.QueryLog.Dir != "" {
 		ql = querylog.New(fc.QueryLog.Dir, fc.QueryLog.BufferSize, fc.QueryLog.MaxFileSize)
@@ -96,23 +67,34 @@ func main() {
 		logger.Info("query logging disabled")
 	}
 
+	c := cache.New()
 	res := resolver.New(c, dc, ql, cfg.UpstreamPrimary, cfg.UpstreamSecondary)
-
-	// 6. Start background reload goroutines
 	reloadTrigger := make(chan struct{}, 1)
-	go lightReloadLoop(c, database, cfg.ReloadInterval)
-	go fullReloadLoop(c, database, cfg.BlocklistReloadInterval, reloadTrigger)
 
-	// 7. Start DoH server
+	// 3. Create DoH handler (database starts nil; SetDatabase called once connected)
 	errCh := make(chan error, 2)
-	handler := doh.New(res, c, dc, ql, database, reloadTrigger, cfg.APIKey)
+	handler := doh.New(res, c, dc, ql, nil, reloadTrigger, cfg.APIKey)
+
+	// 4. Connect to DB and load cache.
+	//    fail_open:  start servers in passthrough mode immediately, load in background.
+	//    fail_closed: block until DB is ready, then start servers.
+	if fc.FailOpen() {
+		logger.Info("fail_mode=open — starting servers in passthrough mode; cache loading in background")
+		res.SetPassthrough(true)
+		go connectAndLoad(res, handler, cfg, c, dc, reloadTrigger)
+	} else {
+		logger.Info("fail_mode=closed — waiting for database before accepting queries")
+		connectAndLoad(res, handler, cfg, c, dc, reloadTrigger)
+	}
+
+	// 5. Start DoH server
 	go func() {
 		if err := doh.Server(cfg.DoHPort, handler); err != nil {
 			errCh <- fmt.Errorf("DoH server: %w", err)
 		}
 	}()
 
-	// 8. Start DoT server (only if cert and key are configured)
+	// 6. Start DoT server (only if cert and key are configured)
 	if cfg.DoTCertFile != "" && cfg.DoTKeyFile != "" {
 		if cfg.DoTBaseDomain == "" {
 			logger.Warn("SCD_DOT_CERT_FILE set but SCD_DOT_BASE_DOMAIN is empty -- skipping DoT")
@@ -150,6 +132,67 @@ func main() {
 			log.Fatalf("FATAL server error: %v", err)
 		}
 	}
+}
+
+// connectAndLoad connects to the database, validates schema, performs the
+// initial cache load, starts the reload loops, and disables passthrough mode.
+// Retries indefinitely on failure. Called synchronously (fail_closed) or as
+// a goroutine (fail_open). Both paths log errors on every retry so failures
+// are visible in the error log regardless of fail_mode.
+func connectAndLoad(res *resolver.Resolver, h *doh.Handler, cfg *config.Config, c *cache.Cache, dc *dnscache.Cache, reloadTrigger chan struct{}) {
+	var database *db.DB
+	var err error
+
+	for {
+		database, err = db.Connect(cfg.DBHost, cfg.DBPort, cfg.DBName, cfg.DBUser, cfg.DBPassword)
+		if err != nil {
+			logger.Error("DB connection failed: %v — retrying in 5s", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		logger.Info("connected to PostgreSQL: %s@%s:%s/%s", cfg.DBUser, cfg.DBHost, cfg.DBPort, cfg.DBName)
+
+		if err = database.ValidateSchema(); err != nil {
+			logger.Error("schema validation failed: %v — retrying in 5s", err)
+			database.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		logger.Info("schema validation passed")
+
+		if err = c.LightReload(database); err != nil {
+			logger.Error("initial light reload failed: %v — retrying in 5s", err)
+			database.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if err = c.FullReload(database); err != nil {
+			logger.Error("initial full reload failed: %v — retrying in 5s", err)
+			database.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		break
+	}
+
+	logger.Info("initial cache load complete")
+
+	// Wire database into the DoH handler for /health.
+	h.SetDatabase(database)
+
+	// Flush the DNS response cache: any responses cached during passthrough
+	// were unfiltered and should not persist now that filtering is active.
+	if dc != nil {
+		dc.Flush()
+	}
+
+	// Disable passthrough — filtering is now active.
+	if res.InPassthrough() {
+		res.SetPassthrough(false)
+	}
+
+	go lightReloadLoop(c, database, cfg.ReloadInterval)
+	go fullReloadLoop(c, database, cfg.BlocklistReloadInterval, reloadTrigger)
 }
 
 // lightReloadLoop reloads devices, profiles, filters, and rules every interval seconds.

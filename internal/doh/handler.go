@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -26,12 +27,15 @@ type Handler struct {
 	cache         *cache.Cache
 	dnsCache      *dnscache.Cache
 	queryLog      *querylog.Logger
-	database      *db.DB
 	reloadTrigger chan struct{}
 	apiKey        string
+
+	dbMu     sync.RWMutex
+	database *db.DB // may be nil during fail_open startup
 }
 
-// New creates a Handler. dc and ql may be nil if features are disabled.
+// New creates a Handler. dc, ql, and database may be nil if features are disabled
+// or not yet available (fail_open startup). Call SetDatabase once connected.
 func New(res *resolver.Resolver, c *cache.Cache, dc *dnscache.Cache, ql *querylog.Logger, database *db.DB, reloadTrigger chan struct{}, apiKey string) *Handler {
 	return &Handler{
 		resolver:      res,
@@ -42,6 +46,14 @@ func New(res *resolver.Resolver, c *cache.Cache, dc *dnscache.Cache, ql *querylo
 		reloadTrigger: reloadTrigger,
 		apiKey:        apiKey,
 	}
+}
+
+// SetDatabase updates the database connection used by the health endpoint.
+// Called once the DB becomes available in fail_open mode.
+func (h *Handler) SetDatabase(d *db.DB) {
+	h.dbMu.Lock()
+	h.database = d
+	h.dbMu.Unlock()
 }
 
 // RegisterRoutes sets up all HTTP routes on the given mux.
@@ -104,6 +116,26 @@ func (h *Handler) doHPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleDNSQuery(w http.ResponseWriter, uid string, data []byte) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			logger.Error("panic in DNS query handler uid=%s: %v — forwarding upstream", uid, rec)
+			// Best-effort upstream forward so the client gets a response
+			var q dns.Msg
+			if err := q.Unpack(data); err == nil {
+				if result := h.resolver.ForwardDirect(&q); result != nil {
+					if packed, err := result.Pack(); err == nil {
+						w.Header().Set("Content-Type", "application/dns-message")
+						w.Header().Set("Cache-Control", "no-cache, no-store")
+						w.WriteHeader(http.StatusOK)
+						w.Write(packed)
+						return
+					}
+				}
+			}
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		}
+	}()
+
 	var query dns.Msg
 	if err := query.Unpack(data); err != nil {
 		http.Error(w, "Invalid DNS message", http.StatusBadRequest)
@@ -132,7 +164,9 @@ func (h *Handler) handleDNSQuery(w http.ResponseWriter, uid string, data []byte)
 
 // health returns service health status. Open to all (no localhost restriction).
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
-	dbOK := h.database.Ping() == nil
+	h.dbMu.RLock()
+	dbOK := h.database != nil && h.database.Ping() == nil
+	h.dbMu.RUnlock()
 	stats := h.cache.Stats()
 
 	status := "ok"

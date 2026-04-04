@@ -132,6 +132,7 @@ Feature toggles live in `/etc/scrolldaddy/dns.json` (path overridable via `SCD_C
 | `query_log.dir` | `/var/log/scrolldaddy/queries` | Directory where per-device `.log` files are written |
 | `query_log.buffer_size` | `4096` | Async write channel buffer. Entries are silently dropped if full (DNS resolution is never blocked). |
 | `query_log.max_file_size` | `2097152` (2 MB) | Per-device log file size before rotation. Rotated file is saved as `{uid}.log.1` (one backup only). Set to `0` to disable rotation. |
+| `fail_mode` | `"open"` | What to do when the database is unavailable at startup. `"open"`: start immediately in passthrough mode — all queries forwarded unfiltered until the cache loads (uptime priority). `"closed"`: refuse all queries until the database is ready (filtering integrity priority). Errors are logged in both modes. |
 
 ---
 
