@@ -254,84 +254,117 @@ To add a new service or update domain lists, edit `services.go` and redeploy the
 
 ## Deployment
 
-### First-time install
+### Building the installer
+
+The `build_installer.sh` script cross-compiles the binary for `linux/amd64`, bundles it with the systemd unit and example config files, and generates a single self-extracting shell script.
+
+**Prerequisites (on the build machine):** Go toolchain, `base64`, `tar`
 
 ```bash
-# 1. Create service user and directories
-useradd --system --no-create-home --shell /usr/sbin/nologin scrolldaddy
-mkdir -p /etc/scrolldaddy /var/log/scrolldaddy /var/log/scrolldaddy/queries
-chown -R scrolldaddy:scrolldaddy /var/log/scrolldaddy
+# Build with an explicit version
+make release VERSION=1.2.3
 
-# 2. Copy binary
-cp scrolldaddy-dns /usr/local/bin/
-chmod 755 /usr/local/bin/scrolldaddy-dns
+# Or let it infer from git tags
+make release
 
-# 3. Write environment file
-cp scrolldaddy.env.example /etc/scrolldaddy/scrolldaddy.env
-# Edit /etc/scrolldaddy/scrolldaddy.env with your values
+# Output: scrolldaddy-dns-installer.sh (~7 MB)
+```
+
+Copy the installer to your server and run it as root:
+
+```bash
+scp scrolldaddy-dns-installer.sh root@<SERVER_IP>:/tmp/
+ssh root@<SERVER_IP> bash /tmp/scrolldaddy-dns-installer.sh [--verbose]
+```
+
+The installer automatically detects whether this is a **fresh install** or an **upgrade** based on whether `/usr/local/bin/scrolldaddy-dns` already exists, and takes the appropriate action.
+
+---
+
+### Fresh install
+
+The installer will:
+1. Create the `scrolldaddy` system user (if not present)
+2. Create `/etc/scrolldaddy`, `/var/log/scrolldaddy`, `/var/log/scrolldaddy/queries`
+3. Install the binary to `/usr/local/bin/scrolldaddy-dns`
+4. Install the systemd unit to `/etc/systemd/system/scrolldaddy-dns.service`
+5. Write `/etc/scrolldaddy/scrolldaddy.env` from the example (if not present)
+6. Write `/etc/scrolldaddy/dns.json` from the example (if not present)
+7. Enable the service (`systemctl enable`) but **not start it** — you must configure it first
+
+**After install:**
+
+```bash
+# 1. Edit the environment file — set database credentials, API key, etc.
+nano /etc/scrolldaddy/scrolldaddy.env
 chown root:scrolldaddy /etc/scrolldaddy/scrolldaddy.env
 chmod 640 /etc/scrolldaddy/scrolldaddy.env
 
-# 4. Install and start systemd service
-cp scrolldaddy-dns.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now scrolldaddy-dns
-```
+# 2. Optionally edit the feature config (DNS cache and query logging toggles)
+nano /etc/scrolldaddy/dns.json
 
-### Updating the binary
-
-```bash
-systemctl stop scrolldaddy-dns
-cp scrolldaddy-dns-new /usr/local/bin/scrolldaddy-dns
+# 3. Start the service
 systemctl start scrolldaddy-dns
-systemctl is-active scrolldaddy-dns
+systemctl status scrolldaddy-dns
+
+# 4. Verify
+curl http://localhost:8053/health
 ```
+
+---
+
+### Upgrade
+
+The installer will:
+1. Back up the existing binary
+2. Update the systemd unit file and example configs (live configs are never touched)
+3. Stop the service, swap the binary, restart
+4. Wait up to 10 seconds for the service to become active
+5. **Automatically roll back** to the previous binary if the service fails to start
+
+No config file changes are needed between upgrades unless the release notes say otherwise.
+
+---
 
 ### Verifying operation
 
 ```bash
-# Service health
+# Service status
 systemctl status scrolldaddy-dns
 
-# Health endpoint
+# Health check (returns 200 or 503 if DB unreachable)
 curl http://localhost:8053/health
 
-# Cache statistics
+# Cache and blocklist statistics
 curl http://localhost:8053/stats
 
-# Test a specific device+domain (no real DNS query)
-curl "http://localhost:8053/test?uid=<resolver_uid>&domain=linkedin.com"
-
-# Check last-seen for a device (from web server)
-curl http://<DNS_SERVER_IP>:8053/device/<resolver_uid>/seen \
-  -H "X-API-Key: <SCD_API_KEY>"
-
-# DNS cache hit rate (in /stats output)
+# DNS cache hit rate
 curl http://localhost:8053/stats | jq '{hits: .dns_cache_hits, misses: .dns_cache_misses, rate: .dns_cache_hit_rate}'
 
-# Flush DNS response cache
-curl -X POST http://localhost:8053/cache/flush \
+# Simulate a resolution for a device (no real DNS query)
+curl "http://localhost:8053/test?uid=<resolver_uid>&domain=linkedin.com"
+
+# Check whether a device has been seen recently (from web server)
+curl http://<SERVER_IP>:8053/device/<resolver_uid>/seen \
   -H "X-API-Key: <SCD_API_KEY>"
 
 # Read last 100 query log lines for a device (from web server)
-curl http://<DNS_SERVER_IP>:8053/device/<resolver_uid>/log \
+curl http://<SERVER_IP>:8053/device/<resolver_uid>/log \
   -H "X-API-Key: <SCD_API_KEY>"
 
-# Live log
+# Flush DNS response cache
+curl -X POST http://<SERVER_IP>:8053/cache/flush \
+  -H "X-API-Key: <SCD_API_KEY>"
+
+# Trigger an immediate reload (also re-reads dns.json)
+curl -X POST http://localhost:8053/reload \
+  -H "X-API-Key: <SCD_API_KEY>"
+
+# Live service log
 tail -f /var/log/scrolldaddy/dns.log
 
 # Live query log for a specific device
 tail -f /var/log/scrolldaddy/queries/<resolver_uid>.log
-```
-
-### Triggering a cache reload
-
-```bash
-# From the DNS server itself (or web server after blocklist update)
-curl -X POST http://localhost:8053/reload
-
-# Via systemd signal (equivalent)
-systemctl reload scrolldaddy-dns
 ```
 
 ---

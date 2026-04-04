@@ -1,0 +1,24 @@
+[Unit]
+Description=ScrollDaddy DNS Server (DoH/DoT)
+Documentation=https://github.com/getjoinery/joinery
+After=network.target
+
+[Service]
+Type=simple
+User=scrolldaddy
+Group=scrolldaddy
+EnvironmentFile=/etc/scrolldaddy/scrolldaddy.env
+ExecStart=/usr/local/bin/scrolldaddy-dns
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Harden the service
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/scrolldaddy /etc/scrolldaddy
+
+[Install]
+WantedBy=multi-user.target

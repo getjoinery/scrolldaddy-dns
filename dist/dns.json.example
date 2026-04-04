@@ -1,0 +1,12 @@
+{
+  "dns_cache": {
+    "enabled": true,
+    "max_size": 10000
+  },
+  "query_log": {
+    "enabled": true,
+    "dir": "/var/log/scrolldaddy/queries",
+    "buffer_size": 4096,
+    "max_file_size": 2097152
+  }
+}
