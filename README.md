@@ -284,33 +284,30 @@ The installer automatically detects whether this is a **fresh install** or an **
 
 ### Fresh install
 
-The installer will:
-1. Create the `scrolldaddy` system user (if not present)
-2. Create `/etc/scrolldaddy`, `/var/log/scrolldaddy`, `/var/log/scrolldaddy/queries`
-3. Install the binary to `/usr/local/bin/scrolldaddy-dns`
-4. Install the systemd unit to `/etc/systemd/system/scrolldaddy-dns.service`
-5. Write `/etc/scrolldaddy/scrolldaddy.env` from the example (if not present)
-6. Write `/etc/scrolldaddy/dns.json` from the example (if not present)
-7. Enable the service (`systemctl enable`) but **not start it** — you must configure it first
+**Before running the installer:**
+- Point a DNS A record at this server's IP (e.g. `dns.example.com`) — Caddy needs this for automatic TLS
+- Have your PostgreSQL host, port, database name, user, and password ready
+- The database must already have the ScrollDaddy schema installed (via the Joinery ScrollDaddy extension)
 
-**After install:**
+The installer runs an interactive setup wizard:
+
+1. Prompts for database credentials, DoH domain, API key (auto-generated if left blank), optional DoT config, and log level
+2. Tests TCP connectivity to the database before proceeding
+3. Writes `/etc/scrolldaddy/scrolldaddy.env` with all provided values
+4. Installs Caddy via apt (Debian/Ubuntu; warns with manual instructions on other systems)
+5. Configures `/etc/caddy/Caddyfile` — only `/resolve/*` and `/health` are exposed publicly; all other endpoints remain on port 8053
+6. Configures ufw firewall — allows 443/tcp and 853/tcp; port 8053 stays blocked externally
+7. Starts the service and displays the health endpoint response
+
+After the wizard completes the server is fully operational. No manual config editing required.
+
+**Non-interactive mode** (for automated/CI installs):
 
 ```bash
-# 1. Edit the environment file — set database credentials, API key, etc.
-nano /etc/scrolldaddy/scrolldaddy.env
-chown root:scrolldaddy /etc/scrolldaddy/scrolldaddy.env
-chmod 640 /etc/scrolldaddy/scrolldaddy.env
-
-# 2. Optionally edit the feature config (DNS cache and query logging toggles)
-nano /etc/scrolldaddy/dns.json
-
-# 3. Start the service
-systemctl start scrolldaddy-dns
-systemctl status scrolldaddy-dns
-
-# 4. Verify
-curl http://localhost:8053/health
+bash scrolldaddy-dns-installer.sh --non-interactive
 ```
+
+Installs files and writes the env template, enables the service but does not start it, and skips Caddy and firewall setup. Edit `/etc/scrolldaddy/scrolldaddy.env` before starting the service.
 
 ---
 
