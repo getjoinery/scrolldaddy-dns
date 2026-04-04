@@ -54,6 +54,7 @@ func makeProfile(id int64, blocked, allowed []string, categories []string) *cach
 func makeResolver(c *cache.Cache) *Resolver {
 	return &Resolver{
 		cache:             c,
+		dnsCache:          nil, // DNS response cache disabled in unit tests
 		upstreamPrimary:   "127.0.0.1:0", // invalid port forces upstream failure
 		upstreamSecondary: "127.0.0.1:0",
 	}

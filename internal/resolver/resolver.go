@@ -7,6 +7,7 @@ import (
 
 	"github.com/miekg/dns"
 	"scrolldaddy-dns/internal/cache"
+	"scrolldaddy-dns/internal/dnscache"
 	"scrolldaddy-dns/internal/logger"
 	"scrolldaddy-dns/internal/upstream"
 )
@@ -49,6 +50,7 @@ type ResolveResult struct {
 // Resolver handles DNS resolution with per-device filtering.
 type Resolver struct {
 	cache             *cache.Cache
+	dnsCache          *dnscache.Cache
 	upstreamPrimary   string
 	upstreamSecondary string
 }
@@ -81,12 +83,32 @@ var safeYouTubeRewrites = map[string]string{
 }
 
 // New creates a Resolver backed by the given cache and upstream servers.
-func New(c *cache.Cache, primary, secondary string) *Resolver {
+// dc may be nil to disable DNS response caching.
+func New(c *cache.Cache, dc *dnscache.Cache, primary, secondary string) *Resolver {
 	return &Resolver{
 		cache:             c,
+		dnsCache:          dc,
 		upstreamPrimary:   primary,
 		upstreamSecondary: secondary,
 	}
+}
+
+// forwardWithCache checks the DNS response cache before forwarding to upstream.
+// On a cache miss it forwards and stores the response for future queries.
+func (r *Resolver) forwardWithCache(query *dns.Msg) (*dns.Msg, error) {
+	if r.dnsCache != nil {
+		if cached := r.dnsCache.Get(query); cached != nil {
+			return cached, nil
+		}
+	}
+	resp, err := upstream.Forward(query, r.upstreamPrimary, r.upstreamSecondary)
+	if err != nil {
+		return nil, err
+	}
+	if r.dnsCache != nil {
+		r.dnsCache.Set(query, resp)
+	}
+	return resp, nil
 }
 
 // Resolve processes a DNS query for the given resolver UID and returns a ResolveResult.
@@ -190,7 +212,7 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 
 	// 4. Custom allow rules bypass all blocking
 	if matched := matchDomain(domain, effectiveCustomAllowed); matched != "" {
-		resp, err := upstream.Forward(query, r.upstreamPrimary, r.upstreamSecondary)
+		resp, err := r.forwardWithCache(query)
 		if err != nil {
 			base.DNSResponse = servFail(query)
 			base.Result = ResultServFail
@@ -248,8 +270,8 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 		}
 	}
 
-	// 7. Forward to upstream
-	resp, err := upstream.Forward(query, r.upstreamPrimary, r.upstreamSecondary)
+	// 7. Forward to upstream (via cache)
+	resp, err := r.forwardWithCache(query)
 	if err != nil {
 		base.DNSResponse = servFail(query)
 		base.Result = ResultServFail
@@ -376,10 +398,10 @@ func (r *Resolver) buildCNAMEResponse(query *dns.Msg, domain, target string) *dn
 		Target: dns.Fqdn(target),
 	})
 
-	// Resolve the CNAME target to get A/AAAA records
+	// Resolve the CNAME target to get A/AAAA records (via cache)
 	targetQuery := new(dns.Msg)
 	targetQuery.SetQuestion(dns.Fqdn(target), query.Question[0].Qtype)
-	targetResp, err := upstream.Forward(targetQuery, r.upstreamPrimary, r.upstreamSecondary)
+	targetResp, err := r.forwardWithCache(targetQuery)
 	if err == nil && targetResp != nil {
 		resp.Answer = append(resp.Answer, targetResp.Answer...)
 	}

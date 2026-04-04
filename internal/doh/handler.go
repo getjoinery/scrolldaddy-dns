@@ -13,6 +13,7 @@ import (
 	"github.com/miekg/dns"
 	"scrolldaddy-dns/internal/cache"
 	"scrolldaddy-dns/internal/db"
+	"scrolldaddy-dns/internal/dnscache"
 	"scrolldaddy-dns/internal/logger"
 	"scrolldaddy-dns/internal/resolver"
 )
@@ -21,16 +22,18 @@ import (
 type Handler struct {
 	resolver      *resolver.Resolver
 	cache         *cache.Cache
+	dnsCache      *dnscache.Cache
 	database      *db.DB
 	reloadTrigger chan struct{}
 	apiKey        string
 }
 
-// New creates a Handler.
-func New(res *resolver.Resolver, c *cache.Cache, database *db.DB, reloadTrigger chan struct{}, apiKey string) *Handler {
+// New creates a Handler. dc may be nil if the DNS response cache is disabled.
+func New(res *resolver.Resolver, c *cache.Cache, dc *dnscache.Cache, database *db.DB, reloadTrigger chan struct{}, apiKey string) *Handler {
 	return &Handler{
 		resolver:      res,
 		cache:         c,
+		dnsCache:      dc,
 		database:      database,
 		reloadTrigger: reloadTrigger,
 		apiKey:        apiKey,
@@ -45,6 +48,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /device/{uid}/seen", h.requireAPIKey(h.deviceSeen))
 	mux.HandleFunc("GET /stats", localhostOnly(h.stats))
 	mux.HandleFunc("POST /reload", h.requireAPIKey(h.reload))
+	mux.HandleFunc("POST /cache/flush", h.requireAPIKey(h.cacheFlush))
 	mux.HandleFunc("GET /test", h.requireAPIKey(h.test))
 }
 
@@ -145,16 +149,35 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 // stats returns cache statistics. Localhost only.
 func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	s := h.cache.Stats()
+	out := map[string]interface{}{
+		"devices":                 s.Devices,
+		"profiles":                s.Profiles,
+		"blocklist_categories":    s.BlocklistCategories,
+		"blocklist_domains_total": s.BlocklistDomains,
+		"last_light_reload":       s.LastLightReload.UTC().Format(time.RFC3339),
+		"last_full_reload":        s.LastFullReload.UTC().Format(time.RFC3339),
+		"uptime_seconds":          s.UptimeSeconds,
+	}
+	if h.dnsCache != nil {
+		ds := h.dnsCache.Stats()
+		out["dns_cache_size"] = ds.Size
+		out["dns_cache_max_size"] = ds.MaxSize
+		out["dns_cache_hits"] = ds.Hits
+		out["dns_cache_misses"] = ds.Misses
+		out["dns_cache_hit_rate"] = ds.HitRate
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"devices":                  s.Devices,
-		"profiles":                 s.Profiles,
-		"blocklist_categories":     s.BlocklistCategories,
-		"blocklist_domains_total":  s.BlocklistDomains,
-		"last_light_reload":        s.LastLightReload.UTC().Format(time.RFC3339),
-		"last_full_reload":         s.LastFullReload.UTC().Format(time.RFC3339),
-		"uptime_seconds":           s.UptimeSeconds,
-	})
+	json.NewEncoder(w).Encode(out)
+}
+
+// cacheFlush flushes the DNS response cache. API-key protected.
+func (h *Handler) cacheFlush(w http.ResponseWriter, r *http.Request) {
+	if h.dnsCache != nil {
+		h.dnsCache.Flush()
+		logger.Info("DNS response cache flushed via API")
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "flushed"})
 }
 
 // reload triggers an immediate full cache reload. Localhost only.

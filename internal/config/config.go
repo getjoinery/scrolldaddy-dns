@@ -25,6 +25,8 @@ type Config struct {
 	ReloadInterval          int
 	BlocklistReloadInterval int
 
+	DNSCacheSize int
+
 	LogLevel string
 	LogFile  string
 
@@ -47,6 +49,7 @@ func Load() (*Config, error) {
 		UpstreamSecondary:       getEnv("SCD_UPSTREAM_SECONDARY", "8.8.8.8:53"),
 		ReloadInterval:          getEnvInt("SCD_RELOAD_INTERVAL", 60),
 		BlocklistReloadInterval: getEnvInt("SCD_BLOCKLIST_RELOAD_INTERVAL", 3600),
+		DNSCacheSize:            getEnvInt("SCD_DNS_CACHE_SIZE", 10000),
 		LogLevel:                getEnv("SCD_LOG_LEVEL", "info"),
 		LogFile:                 getEnv("SCD_LOG_FILE", "stdout"),
 		APIKey:                  getEnv("SCD_API_KEY", ""),

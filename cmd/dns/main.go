@@ -11,6 +11,7 @@ import (
 	"scrolldaddy-dns/internal/cache"
 	"scrolldaddy-dns/internal/config"
 	"scrolldaddy-dns/internal/db"
+	"scrolldaddy-dns/internal/dnscache"
 	"scrolldaddy-dns/internal/doh"
 	"scrolldaddy-dns/internal/dot"
 	"scrolldaddy-dns/internal/logger"
@@ -67,8 +68,15 @@ func main() {
 	}
 	logger.Info("initial cache load complete")
 
-	// 5. Create resolver
-	res := resolver.New(c, cfg.UpstreamPrimary, cfg.UpstreamSecondary)
+	// 5. Create DNS response cache and resolver
+	var dc *dnscache.Cache
+	if cfg.DNSCacheSize > 0 {
+		dc = dnscache.New(cfg.DNSCacheSize)
+		logger.Info("DNS response cache enabled (max %d entries)", cfg.DNSCacheSize)
+	} else {
+		logger.Info("DNS response cache disabled (SCD_DNS_CACHE_SIZE=0)")
+	}
+	res := resolver.New(c, dc, cfg.UpstreamPrimary, cfg.UpstreamSecondary)
 
 	// 6. Start background reload goroutines
 	reloadTrigger := make(chan struct{}, 1)
@@ -77,7 +85,7 @@ func main() {
 
 	// 7. Start DoH server
 	errCh := make(chan error, 2)
-	handler := doh.New(res, c, database, reloadTrigger, cfg.APIKey)
+	handler := doh.New(res, c, dc, database, reloadTrigger, cfg.APIKey)
 	go func() {
 		if err := doh.Server(cfg.DoHPort, handler); err != nil {
 			errCh <- fmt.Errorf("DoH server: %w", err)
