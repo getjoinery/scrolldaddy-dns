@@ -16,8 +16,11 @@ On each query the server:
 2. Determines the active profile (primary, or secondary if a schedule is active)
 3. Checks the query domain against custom allow rules → custom block rules → category blocklists → service blocks
 4. Returns NXDOMAIN if blocked, or forwards to an upstream resolver (Cloudflare/Google) if not
+5. Cache hit: returns a cached DNS response with decremented TTLs (bypasses upstream entirely)
 
 Configuration is stored in the Joinery PostgreSQL database and loaded into memory on startup, then refreshed every 60 seconds (device/filter changes) and every 3600 seconds (blocklist domains). No restart is required for config changes.
+
+Feature toggles (DNS response cache, query logging) are controlled by a JSON config file at `/etc/scrolldaddy/dns.json` and hot-reloaded on SIGHUP or POST /reload.
 
 ---
 
@@ -26,13 +29,15 @@ Configuration is stored in the Joinery PostgreSQL database and loaded into memor
 ```
 cmd/dns/main.go              Entry point. Wires all components together.
 internal/
-  config/config.go           Environment variable loading and validation.
+  config/config.go           Environment variable loading, JSON feature config, and validation.
   db/db.go                   PostgreSQL connection, schema validation, data loading.
   cache/
     cache.go                 In-memory store: devices, profiles, blocklists, last-seen.
     services.go              Hardcoded service→domain mappings (LinkedIn, Facebook, etc.)
+  dnscache/dnscache.go       TTL-aware DNS response cache (bypasses upstream on cache hit).
+  querylog/querylog.go       Per-device flat file query logger (async, non-blocking).
   resolver/resolver.go       Core DNS resolution logic and filtering decisions.
-  doh/handler.go             HTTP handlers: DoH GET/POST, /health, /device/{uid}/seen, /stats, /reload, /test.
+  doh/handler.go             HTTP handlers: DoH GET/POST, /health, /device/{uid}/seen, /stats, /reload, /test, /device/{uid}/log, /device/{uid}/log/purge.
   dot/server.go              DoT server: SNI-based UID extraction, TLS termination.
   upstream/upstream.go       UDP/TCP forwarding to upstream DNS resolvers.
   logger/logger.go           Leveled logger (debug/info/warn/error).
@@ -60,7 +65,11 @@ make test
 
 ## Configuration
 
-All configuration is via environment variables (typically loaded from `/etc/scrolldaddy/scrolldaddy.env`).
+Configuration comes from two sources: **environment variables** (core settings) and a **JSON feature config file** (runtime-toggleable features).
+
+### Environment Variables
+
+Typically loaded from `/etc/scrolldaddy/scrolldaddy.env`.
 
 | Variable | Default | Required | Description |
 |----------|---------|----------|-------------|
@@ -78,11 +87,51 @@ All configuration is via environment variables (typically loaded from `/etc/scro
 | `SCD_UPSTREAM_SECONDARY` | `8.8.8.8:53` | — | Fallback upstream DNS resolver |
 | `SCD_RELOAD_INTERVAL` | `60` | — | Seconds between device/filter cache reloads |
 | `SCD_BLOCKLIST_RELOAD_INTERVAL` | `3600` | — | Seconds between blocklist domain reloads |
-| `SCD_API_KEY` | — | — | API key for `/device/{uid}/seen` endpoint. If unset, endpoint is open. |
+| `SCD_API_KEY` | — | — | API key for protected endpoints. If unset, all API-key-protected endpoints are open. |
 | `SCD_LOG_LEVEL` | `info` | — | Log verbosity: `debug`, `info`, `warn`, `error` |
 | `SCD_LOG_FILE` | `stdout` | — | Log destination: `stdout` or a file path |
+| `SCD_CONFIG_FILE` | `/etc/scrolldaddy/dns.json` | — | Path to JSON feature config file (see below) |
+
+**Feature override env vars** (override values in the JSON config file):
+
+| Variable | Overrides | Description |
+|----------|-----------|-------------|
+| `SCD_DNS_CACHE_SIZE` | `dns_cache.max_size` | Max cached entries. Set to `0` to disable cache entirely. |
+| `SCD_QUERY_LOG_DIR` | `query_log.dir` | Directory for per-device query log files. Set to empty string to disable logging. |
+| `SCD_QUERY_LOG_BUFFER` | `query_log.buffer_size` | Channel buffer depth for async log writes. |
+| `SCD_QUERY_LOG_MAX_SIZE` | `query_log.max_file_size` | Per-device log file rotation threshold in bytes. |
 
 DoT is only started if `SCD_DOT_CERT_FILE` and `SCD_DOT_KEY_FILE` are both set **and** `SCD_DOT_BASE_DOMAIN` is non-empty.
+
+### JSON Feature Config File
+
+Feature toggles live in `/etc/scrolldaddy/dns.json` (path overridable via `SCD_CONFIG_FILE`). The file is optional — if missing, built-in defaults apply. It is re-read on every SIGHUP or POST /reload, so changes take effect without a restart.
+
+**Environment variables always override JSON file values.**
+
+```json
+{
+  "dns_cache": {
+    "enabled": true,
+    "max_size": 10000
+  },
+  "query_log": {
+    "enabled": true,
+    "dir": "/var/log/scrolldaddy/queries",
+    "buffer_size": 4096,
+    "max_file_size": 2097152
+  }
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `dns_cache.enabled` | `true` | Enable/disable the DNS response cache |
+| `dns_cache.max_size` | `10000` | Maximum number of cached DNS responses. Oldest entries evicted when full. |
+| `query_log.enabled` | `true` | Enable/disable per-device query logging globally. Individual devices also need `sdd_log_queries = true` in the database. |
+| `query_log.dir` | `/var/log/scrolldaddy/queries` | Directory where per-device `.log` files are written |
+| `query_log.buffer_size` | `4096` | Async write channel buffer. Entries are silently dropped if full (DNS resolution is never blocked). |
+| `query_log.max_file_size` | `2097152` (2 MB) | Per-device log file size before rotation. Rotated file is saved as `{uid}.log.1` (one backup only). Set to `0` to disable rotation. |
 
 ---
 
@@ -98,17 +147,83 @@ DoT is only started if `SCD_DOT_CERT_FILE` and `SCD_DOT_KEY_FILE` are both set *
 
 ### Web server API (port 8053, firewall-restricted to web server IP)
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `GET` | `/device/{uid}/seen` | `X-API-Key` header | Returns last time this UID made a DNS query. Response: `{"uid":"...","seen":true,"last_seen":"2026-01-01T12:00:00Z"}` or `{"seen":false,"last_seen":null}`. Last-seen is in-memory only — resets on service restart. |
+All endpoints below require the `X-API-Key` header (or `?api_key=` query parameter) if `SCD_API_KEY` is configured.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/device/{uid}/seen` | Returns last time this UID made a DNS query. Response: `{"uid":"...","seen":true,"last_seen":"2026-01-01T12:00:00Z"}` or `{"seen":false,"last_seen":null}`. Last-seen is in-memory only — resets on service restart. |
+| `GET` | `/device/{uid}/log?lines=N` | Returns the last N lines (default 100) of the device's query log as plain text. Returns 404 if query logging is disabled. |
+| `POST` | `/device/{uid}/log/purge` | Truncates the device's query log file. Returns `{"status":"purged"}`. |
+| `POST` | `/reload` | Triggers an immediate full cache reload (blocklist + device data) and re-reads the JSON feature config file. |
+| `POST` | `/cache/flush` | Flushes the DNS response cache. Subsequent queries go to upstream until the cache warms up again. |
 
 ### Localhost only (port 8053, blocked by firewall externally)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/stats` | Cache statistics: device count, profile count, blocklist domain count, reload times, uptime. |
-| `POST` | `/reload` | Triggers an immediate full cache reload (blocklist + device data). Used by web server after blocklist download. |
+| `GET` | `/stats` | Cache statistics: device count, profile count, blocklist domain count, DNS cache hit rate, reload times, uptime. |
 | `GET` | `/test?uid=<uid>&domain=<domain>` | Simulates resolution for a UID/domain pair without making a real DNS query. Returns result, reason, matched rule, and active profile info. |
+
+---
+
+## DNS Response Cache
+
+When enabled, resolved DNS responses are cached in memory with their original TTLs. On a cache hit, TTLs in the returned response are decremented by elapsed time — the client sees accurate remaining TTL values and the upstream resolver is not contacted at all.
+
+**Cache behavior:**
+- Only successful responses (NOERROR, NXDOMAIN) are cached. SERVFAIL and other errors are never cached.
+- Responses with TTL = 0 on all records are not cached (the domain signals no caching).
+- Cache key is `qname + qtype + qclass` (case-insensitive on the name).
+- When the cache reaches `max_size`, the oldest entries are evicted first.
+- The cache is flushed atomically by POST /cache/flush (e.g. after a blocklist update).
+
+**Stats** (available at GET /stats):
+```json
+{
+  "dns_cache_size": 1423,
+  "dns_cache_max_size": 10000,
+  "dns_cache_hits": 98712,
+  "dns_cache_misses": 4301,
+  "dns_cache_hit_rate": 0.9582
+}
+```
+
+---
+
+## Per-Device Query Logging
+
+When enabled globally (in `dns.json`) **and** for a specific device (`sdd_log_queries = true` in the database), every DNS query is appended to a flat file: `/var/log/scrolldaddy/queries/{uid}.log`.
+
+**Log format** — tab-separated, one line per query:
+```
+2026-04-04T19:23:45Z	google.com	A	FORWARDED	not_blocked		no
+```
+
+Fields: `timestamp` `domain` `qtype` `result` `reason` `category` `cached`
+
+- `result`: `FORWARDED`, `BLOCKED`, `ALLOWED` (custom allow rule), `REWRITE` (SafeSearch/SafeYouTube)
+- `reason`: `not_blocked`, `custom_allow`, `custom_block`, `category`, `safesearch`, `safeyoutube`, `service`
+- `category`: blocklist category key if blocked by a category (otherwise empty)
+- `cached`: `yes` if the response came from the DNS response cache, `no` otherwise
+
+**File rotation:** Each device file is rotated at `max_file_size` (default 2 MB). The current file is renamed to `{uid}.log.1` and a new file starts. Only one backup is kept. Set `max_file_size = 0` to disable rotation.
+
+**Performance:** Log writes are asynchronous — a background goroutine drains a buffered channel. DNS resolution is never blocked by file I/O. If the buffer fills up, entries are silently dropped rather than slowing queries.
+
+**Retrieving logs** (from the web server):
+```bash
+# Last 100 lines for a device
+curl http://<DNS_SERVER_IP>:8053/device/<uid>/log \
+  -H "X-API-Key: <SCD_API_KEY>"
+
+# Specific number of lines
+curl "http://<DNS_SERVER_IP>:8053/device/<uid>/log?lines=500" \
+  -H "X-API-Key: <SCD_API_KEY>"
+
+# Truncate log
+curl -X POST http://<DNS_SERVER_IP>:8053/device/<uid>/log/purge \
+  -H "X-API-Key: <SCD_API_KEY>"
+```
 
 ---
 
@@ -131,7 +246,7 @@ Each device has a primary profile (always active) and an optional secondary prof
 
 ### Service Domains
 
-Services (LinkedIn, Facebook, etc.) are defined in `internal/cache/services.go` as a hardcoded map of `service_key → []domains`. When the web app enables a service block for a profile, it saves a row to `cds_ctldservices`. The DNS server loads active services on each cache reload and merges their domains into the profile's custom block set.
+Services (LinkedIn, Facebook, etc.) are defined in `internal/cache/services.go` as a hardcoded map of `service_key → []domains`. When the web app enables a service block for a profile, it saves a row to `sds_services`. The DNS server loads active services on each cache reload and merges their domains into the profile's custom block set.
 
 To add a new service or update domain lists, edit `services.go` and redeploy the binary.
 
@@ -144,8 +259,8 @@ To add a new service or update domain lists, edit `services.go` and redeploy the
 ```bash
 # 1. Create service user and directories
 useradd --system --no-create-home --shell /usr/sbin/nologin scrolldaddy
-mkdir -p /etc/scrolldaddy /var/log/scrolldaddy
-chown scrolldaddy:scrolldaddy /var/log/scrolldaddy
+mkdir -p /etc/scrolldaddy /var/log/scrolldaddy /var/log/scrolldaddy/queries
+chown -R scrolldaddy:scrolldaddy /var/log/scrolldaddy
 
 # 2. Copy binary
 cp scrolldaddy-dns /usr/local/bin/
@@ -191,8 +306,22 @@ curl "http://localhost:8053/test?uid=<resolver_uid>&domain=linkedin.com"
 curl http://<DNS_SERVER_IP>:8053/device/<resolver_uid>/seen \
   -H "X-API-Key: <SCD_API_KEY>"
 
+# DNS cache hit rate (in /stats output)
+curl http://localhost:8053/stats | jq '{hits: .dns_cache_hits, misses: .dns_cache_misses, rate: .dns_cache_hit_rate}'
+
+# Flush DNS response cache
+curl -X POST http://localhost:8053/cache/flush \
+  -H "X-API-Key: <SCD_API_KEY>"
+
+# Read last 100 query log lines for a device (from web server)
+curl http://<DNS_SERVER_IP>:8053/device/<resolver_uid>/log \
+  -H "X-API-Key: <SCD_API_KEY>"
+
 # Live log
 tail -f /var/log/scrolldaddy/dns.log
+
+# Live query log for a specific device
+tail -f /var/log/scrolldaddy/queries/<resolver_uid>.log
 ```
 
 ### Triggering a cache reload
@@ -213,11 +342,11 @@ The service reads from these tables (read-only user sufficient):
 
 | Table | Purpose |
 |-------|---------|
-| `cdd_ctlddevices` | Devices: resolver UID, active status, timezone, profile assignments |
-| `cdp_ctldprofiles` | Profiles: schedule config, SafeSearch/SafeYouTube flags |
-| `cdf_ctldfilters` | Enabled blocklist categories per profile |
-| `cds_ctldservices` | Enabled service blocks per profile (LinkedIn, Facebook, etc.) |
-| `cdr_ctldrules` | Custom domain rules per profile (block/allow) |
+| `sdd_devices` | Devices: resolver UID, active status, timezone, profile assignments, `sdd_log_queries` flag |
+| `sdp_profiles` | Profiles: schedule config, SafeSearch/SafeYouTube flags |
+| `sdf_filters` | Enabled blocklist categories per profile |
+| `sds_services` | Enabled service blocks per profile (LinkedIn, Facebook, etc.) |
+| `sdr_rules` | Custom domain rules per profile (block/allow) |
 | `bld_blocklist_domains` | Blocklist domain entries by category key |
 
 Schema validation runs at startup — the service refuses to start if any required table or column is missing.
@@ -229,4 +358,4 @@ Schema validation runs at startup — the service refuses to start if any requir
 | Signal | Effect |
 |--------|--------|
 | `SIGTERM` / `SIGINT` | Graceful shutdown |
-| `SIGHUP` | Triggers an immediate full cache reload (same as POST /reload) |
+| `SIGHUP` | Triggers an immediate full cache reload and re-reads the JSON feature config file (same as POST /reload) |
