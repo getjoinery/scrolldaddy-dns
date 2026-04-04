@@ -215,6 +215,8 @@ func (c *Cache) LightReload(database *db.DB) error {
 				}
 			}
 		}
+		// TODO(scaling): Same expansion issue as in the block service rules below —
+		// each profile gets its own copy of the expanded service domain maps.
 		if services, ok := serviceMap[profileID]; ok {
 			for _, svcKey := range services {
 				if domains, ok := ServiceDomains[svcKey]; ok {
@@ -273,6 +275,13 @@ func (c *Cache) LightReload(database *db.DB) error {
 				sb.AllowKeys = append(sb.AllowKeys, r.Key)
 			}
 		}
+
+		// TODO(scaling): Service domain expansion duplicates domain sets per profile/block.
+		// At large user counts, consider storing ServiceDomains as a shared cache map
+		// (like blocklistDomains) and resolving service keys at query time rather than
+		// expanding them into per-profile/per-block CustomBlocked maps at build time.
+		// This would make per-user memory cost O(1) for services instead of O(domains-per-service).
+		// See: internal/cache/services.go for the domain lists.
 
 		// Partition service rules by action; also expand block services to domains
 		for _, r := range blockServicesByID[b.BlockID] {
