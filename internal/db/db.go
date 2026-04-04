@@ -17,20 +17,13 @@ type DB struct {
 
 // DeviceRow holds raw data from the device+profile join query.
 type DeviceRow struct {
-	DeviceID             int64
-	ResolverUID          string
-	PrimaryProfileID     int64
-	SecondaryProfileID   sql.NullInt64
-	IsActive             bool
-	Timezone             string
-	ScheduleStart        sql.NullString
-	ScheduleEnd          sql.NullString
-	ScheduleDays         sql.NullString // JSON array: ["mon","tue"]
-	ScheduleTimezone     sql.NullString
-	PrimarySafeSearch    sql.NullBool
-	PrimarySafeYouTube   sql.NullBool
-	SecondarySafeSearch  sql.NullBool
-	SecondarySafeYouTube sql.NullBool
+	DeviceID           int64
+	ResolverUID        string
+	PrimaryProfileID   int64
+	IsActive           bool
+	Timezone           string
+	PrimarySafeSearch  sql.NullBool
+	PrimarySafeYouTube sql.NullBool
 }
 
 // RuleRow holds a single custom DNS rule.
@@ -38,6 +31,24 @@ type RuleRow struct {
 	ProfileID int64
 	Hostname  string
 	Action    int // 0=block, 1=allow
+}
+
+// ScheduledBlockRow holds raw data from the scheduled blocks query.
+type ScheduledBlockRow struct {
+	BlockID          int64
+	DeviceID         int64
+	Name             string
+	ScheduleStart    sql.NullString
+	ScheduleEnd      sql.NullString
+	ScheduleDays     sql.NullString
+	ScheduleTimezone sql.NullString
+}
+
+// ScheduledBlockRuleRow holds a filter/service/domain rule for a scheduled block.
+type ScheduledBlockRuleRow struct {
+	BlockID int64
+	Key     string
+	Action  int
 }
 
 // Connect opens and verifies a PostgreSQL connection.
@@ -75,24 +86,44 @@ func (db *DB) Close() {
 // Returns a descriptive error listing every missing table/column.
 func (db *DB) ValidateSchema() error {
 	expected := map[string][]string{
-		"cdd_ctlddevices": {
-			"cdd_ctlddevice_id", "cdd_resolver_uid",
-			"cdd_cdp_ctldprofile_id_primary", "cdd_cdp_ctldprofile_id_secondary",
-			"cdd_is_active", "cdd_timezone", "cdd_delete_time",
+		"sdd_devices": {
+			"sdd_device_id", "sdd_resolver_uid",
+			"sdd_sdp_profile_id_primary", "sdd_sdp_profile_id_secondary",
+			"sdd_is_active", "sdd_timezone", "sdd_delete_time",
 		},
-		"cdp_ctldprofiles": {
-			"cdp_ctldprofile_id", "cdp_schedule_start", "cdp_schedule_end",
-			"cdp_schedule_days", "cdp_schedule_timezone",
-			"cdp_safesearch", "cdp_safeyoutube",
+		"sdp_profiles": {
+			"sdp_profile_id", "sdp_schedule_start", "sdp_schedule_end",
+			"sdp_schedule_days", "sdp_schedule_timezone",
+			"sdp_safesearch", "sdp_safeyoutube",
 		},
-		"cdf_ctldfilters": {
-			"cdf_cdp_ctldprofile_id", "cdf_filter_pk", "cdf_is_active",
+		"sdf_filters": {
+			"sdf_sdp_profile_id", "sdf_filter_key", "sdf_is_active",
 		},
-		"cdr_ctldrules": {
-			"cdr_cdp_ctldprofile_id", "cdr_rule_hostname", "cdr_rule_action", "cdr_is_active",
+		"sdr_rules": {
+			"sdr_sdp_profile_id", "sdr_hostname", "sdr_action", "sdr_is_active",
+		},
+		"sds_services": {
+			"sds_sdp_profile_id", "sds_service_key", "sds_is_active",
 		},
 		"bld_blocklist_domains": {
 			"bld_category_key", "bld_domain",
+		},
+		"sdb_scheduled_blocks": {
+			"sdb_scheduled_block_id", "sdb_sdd_device_id", "sdb_name",
+			"sdb_schedule_start", "sdb_schedule_end", "sdb_schedule_days",
+			"sdb_schedule_timezone", "sdb_is_active", "sdb_delete_time",
+		},
+		"sbf_scheduled_block_filters": {
+			"sbf_scheduled_block_filter_id", "sbf_sdb_scheduled_block_id",
+			"sbf_filter_key", "sbf_action",
+		},
+		"sbs_scheduled_block_services": {
+			"sbs_scheduled_block_service_id", "sbs_sdb_scheduled_block_id",
+			"sbs_service_key", "sbs_action",
+		},
+		"sbr_scheduled_block_rules": {
+			"sbr_scheduled_block_rule_id", "sbr_sdb_scheduled_block_id",
+			"sbr_hostname", "sbr_is_active", "sbr_action",
 		},
 	}
 
@@ -134,7 +165,7 @@ func (db *DB) ValidateSchema() error {
 	return nil
 }
 
-// LoadDevices loads all active devices with profile and schedule info.
+// LoadDevices loads all active devices with primary profile info.
 func (db *DB) LoadDevices() ([]*DeviceRow, error) {
 	tx, err := db.conn.Begin()
 	if err != nil {
@@ -148,29 +179,20 @@ func (db *DB) LoadDevices() ([]*DeviceRow, error) {
 
 	const query = `
 		SELECT
-			d.cdd_ctlddevice_id,
-			d.cdd_resolver_uid,
-			d.cdd_cdp_ctldprofile_id_primary,
-			d.cdd_cdp_ctldprofile_id_secondary,
-			COALESCE(d.cdd_is_active, false),
-			COALESCE(d.cdd_timezone, 'UTC'),
-			p2.cdp_schedule_start,
-			p2.cdp_schedule_end,
-			p2.cdp_schedule_days,
-			p2.cdp_schedule_timezone,
-			p1.cdp_safesearch,
-			p1.cdp_safeyoutube,
-			p2.cdp_safesearch,
-			p2.cdp_safeyoutube
-		FROM cdd_ctlddevices d
-		JOIN cdp_ctldprofiles p1
-			ON d.cdd_cdp_ctldprofile_id_primary = p1.cdp_ctldprofile_id
-		LEFT JOIN cdp_ctldprofiles p2
-			ON d.cdd_cdp_ctldprofile_id_secondary = p2.cdp_ctldprofile_id
-		WHERE d.cdd_delete_time IS NULL
-		  AND d.cdd_is_active = TRUE
-		  AND d.cdd_resolver_uid IS NOT NULL
-		  AND d.cdd_resolver_uid != ''
+			d.sdd_device_id,
+			d.sdd_resolver_uid,
+			d.sdd_sdp_profile_id_primary,
+			COALESCE(d.sdd_is_active, false),
+			COALESCE(d.sdd_timezone, 'UTC'),
+			p1.sdp_safesearch,
+			p1.sdp_safeyoutube
+		FROM sdd_devices d
+		JOIN sdp_profiles p1
+			ON d.sdd_sdp_profile_id_primary = p1.sdp_profile_id
+		WHERE d.sdd_delete_time IS NULL
+		  AND d.sdd_is_active = TRUE
+		  AND d.sdd_resolver_uid IS NOT NULL
+		  AND d.sdd_resolver_uid != ''
 	`
 
 	rows, err := tx.Query(query)
@@ -186,17 +208,10 @@ func (db *DB) LoadDevices() ([]*DeviceRow, error) {
 			&d.DeviceID,
 			&d.ResolverUID,
 			&d.PrimaryProfileID,
-			&d.SecondaryProfileID,
 			&d.IsActive,
 			&d.Timezone,
-			&d.ScheduleStart,
-			&d.ScheduleEnd,
-			&d.ScheduleDays,
-			&d.ScheduleTimezone,
 			&d.PrimarySafeSearch,
 			&d.PrimarySafeYouTube,
-			&d.SecondarySafeSearch,
-			&d.SecondarySafeYouTube,
 		); err != nil {
 			return nil, err
 		}
@@ -211,15 +226,15 @@ func (db *DB) LoadDevices() ([]*DeviceRow, error) {
 }
 
 // LoadFilters loads all active filter assignments, keyed by profile ID.
-// Note: cdf_cdp_ctldprofile_id is varchar in the schema but stores integer values.
+// Note: sdf_sdp_profile_id is varchar in the schema but stores integer values.
 func (db *DB) LoadFilters() (map[int64][]string, error) {
 	const query = `
 		SELECT
-			cdf_cdp_ctldprofile_id::bigint AS profile_id,
-			cdf_filter_pk AS category_key
-		FROM cdf_ctldfilters
-		WHERE cdf_is_active = 1
-		  AND cdf_cdp_ctldprofile_id ~ '^[0-9]+$'
+			sdf_sdp_profile_id::bigint AS profile_id,
+			sdf_filter_key AS category_key
+		FROM sdf_filters
+		WHERE sdf_is_active = 1
+		  AND sdf_sdp_profile_id ~ '^[0-9]+$'
 	`
 	rows, err := db.conn.Query(query)
 	if err != nil {
@@ -240,16 +255,16 @@ func (db *DB) LoadFilters() (map[int64][]string, error) {
 }
 
 // LoadRules loads all active custom rules, keyed by profile ID.
-// Note: cdr_cdp_ctldprofile_id is varchar in the schema but stores integer values.
+// Note: sdr_sdp_profile_id is varchar in the schema but stores integer values.
 func (db *DB) LoadRules() (map[int64][]*RuleRow, error) {
 	const query = `
 		SELECT
-			cdr_cdp_ctldprofile_id::bigint AS profile_id,
-			cdr_rule_hostname AS hostname,
-			cdr_rule_action AS action
-		FROM cdr_ctldrules
-		WHERE cdr_is_active = 1
-		  AND cdr_cdp_ctldprofile_id ~ '^[0-9]+$'
+			sdr_sdp_profile_id::bigint AS profile_id,
+			sdr_hostname AS hostname,
+			sdr_action AS action
+		FROM sdr_rules
+		WHERE sdr_is_active = 1
+		  AND sdr_sdp_profile_id ~ '^[0-9]+$'
 	`
 	rows, err := db.conn.Query(query)
 	if err != nil {
@@ -269,15 +284,15 @@ func (db *DB) LoadRules() (map[int64][]*RuleRow, error) {
 }
 
 // LoadServices loads all active service assignments, keyed by profile ID.
-// Note: cds_cdp_ctldprofile_id is varchar in the schema but stores integer values.
+// Note: sds_sdp_profile_id is varchar in the schema but stores integer values.
 func (db *DB) LoadServices() (map[int64][]string, error) {
 	const query = `
 		SELECT
-			cds_cdp_ctldprofile_id::bigint AS profile_id,
-			cds_service_pk AS service_key
-		FROM cds_ctldservices
-		WHERE cds_is_active = 1
-		  AND cds_cdp_ctldprofile_id ~ '^[0-9]+$'
+			sds_sdp_profile_id::bigint AS profile_id,
+			sds_service_key AS service_key
+		FROM sds_services
+		WHERE sds_is_active = 1
+		  AND sds_sdp_profile_id ~ '^[0-9]+$'
 	`
 	rows, err := db.conn.Query(query)
 	if err != nil {
@@ -335,7 +350,135 @@ func (db *DB) GetBlocklistVersion() string {
 	return version
 }
 
-// ParseScheduleDays parses the cdp_schedule_days JSON field (e.g. ["mon","tue","wed"]).
+// LoadScheduledBlocks loads all active, non-deleted scheduled blocks.
+func (db *DB) LoadScheduledBlocks() ([]*ScheduledBlockRow, error) {
+	const query = `
+		SELECT
+			sdb_scheduled_block_id,
+			sdb_sdd_device_id,
+			COALESCE(sdb_name, ''),
+			sdb_schedule_start,
+			sdb_schedule_end,
+			sdb_schedule_days,
+			sdb_schedule_timezone
+		FROM sdb_scheduled_blocks
+		WHERE sdb_is_active = TRUE
+		  AND sdb_delete_time IS NULL
+	`
+	rows, err := db.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var blocks []*ScheduledBlockRow
+	for rows.Next() {
+		b := &ScheduledBlockRow{}
+		if err := rows.Scan(
+			&b.BlockID,
+			&b.DeviceID,
+			&b.Name,
+			&b.ScheduleStart,
+			&b.ScheduleEnd,
+			&b.ScheduleDays,
+			&b.ScheduleTimezone,
+		); err != nil {
+			return nil, err
+		}
+		blocks = append(blocks, b)
+	}
+	return blocks, rows.Err()
+}
+
+// LoadScheduledBlockFilterRules loads all filter rules for active scheduled blocks.
+func (db *DB) LoadScheduledBlockFilterRules() ([]*ScheduledBlockRuleRow, error) {
+	const query = `
+		SELECT
+			sbf_sdb_scheduled_block_id,
+			sbf_filter_key,
+			sbf_action
+		FROM sbf_scheduled_block_filters
+		JOIN sdb_scheduled_blocks ON sdb_scheduled_block_id = sbf_sdb_scheduled_block_id
+		WHERE sdb_is_active = TRUE
+		  AND sdb_delete_time IS NULL
+	`
+	rows, err := db.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var rules []*ScheduledBlockRuleRow
+	for rows.Next() {
+		r := &ScheduledBlockRuleRow{}
+		if err := rows.Scan(&r.BlockID, &r.Key, &r.Action); err != nil {
+			return nil, err
+		}
+		rules = append(rules, r)
+	}
+	return rules, rows.Err()
+}
+
+// LoadScheduledBlockServiceRules loads all service rules for active scheduled blocks.
+func (db *DB) LoadScheduledBlockServiceRules() ([]*ScheduledBlockRuleRow, error) {
+	const query = `
+		SELECT
+			sbs_sdb_scheduled_block_id,
+			sbs_service_key,
+			sbs_action
+		FROM sbs_scheduled_block_services
+		JOIN sdb_scheduled_blocks ON sdb_scheduled_block_id = sbs_sdb_scheduled_block_id
+		WHERE sdb_is_active = TRUE
+		  AND sdb_delete_time IS NULL
+	`
+	rows, err := db.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var rules []*ScheduledBlockRuleRow
+	for rows.Next() {
+		r := &ScheduledBlockRuleRow{}
+		if err := rows.Scan(&r.BlockID, &r.Key, &r.Action); err != nil {
+			return nil, err
+		}
+		rules = append(rules, r)
+	}
+	return rules, rows.Err()
+}
+
+// LoadScheduledBlockDomainRules loads all domain rules for active scheduled blocks.
+func (db *DB) LoadScheduledBlockDomainRules() ([]*ScheduledBlockRuleRow, error) {
+	const query = `
+		SELECT
+			sbr_sdb_scheduled_block_id,
+			sbr_hostname,
+			sbr_action
+		FROM sbr_scheduled_block_rules
+		JOIN sdb_scheduled_blocks ON sdb_scheduled_block_id = sbr_sdb_scheduled_block_id
+		WHERE sbr_is_active = 1
+		  AND sdb_is_active = TRUE
+		  AND sdb_delete_time IS NULL
+	`
+	rows, err := db.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var rules []*ScheduledBlockRuleRow
+	for rows.Next() {
+		r := &ScheduledBlockRuleRow{}
+		if err := rows.Scan(&r.BlockID, &r.Key, &r.Action); err != nil {
+			return nil, err
+		}
+		rules = append(rules, r)
+	}
+	return rules, rows.Err()
+}
+
+// ParseScheduleDays parses the schedule_days JSON field (e.g. ["mon","tue","wed"]).
 func ParseScheduleDays(raw sql.NullString) []string {
 	if !raw.Valid || raw.String == "" {
 		return nil

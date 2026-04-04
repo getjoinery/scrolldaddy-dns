@@ -223,42 +223,45 @@ func TestDNSResponseFlags(t *testing.T) {
 
 // --- Schedule tests ---
 
-func TestSchedule_NoSecondaryProfile_UsesPrimary(t *testing.T) {
+func TestSchedule_NoBlocks_NothingActive(t *testing.T) {
 	dev := &cache.DeviceInfo{
-		ResolverUID:        "4444444444444444444444444444444a",
-		PrimaryProfileID:   1,
-		SecondaryProfileID: 0, // no secondary
-		IsActive:           true,
-		Timezone:           time.UTC,
+		ResolverUID:      "4444444444444444444444444444444a",
+		PrimaryProfileID: 1,
+		IsActive:         true,
+		Timezone:         time.UTC,
+		ScheduledBlocks:  nil, // no scheduled blocks
 	}
-	if isScheduleActive(dev) {
-		t.Error("no secondary profile means schedule should never be active")
+	// With no scheduled blocks, none should be active
+	for i := range dev.ScheduledBlocks {
+		if isBlockActive(&dev.ScheduledBlocks[i], dev.Timezone) {
+			t.Error("no scheduled blocks means nothing should be active")
+		}
 	}
 }
 
 func TestSchedule_EmptyDays(t *testing.T) {
-	dev := &cache.DeviceInfo{
-		SecondaryProfileID: 2,
-		ScheduleStart:      "08:00",
-		ScheduleEnd:        "17:00",
-		ScheduleDays:       []string{},
-		ScheduleTimezone:   time.UTC,
+	block := &cache.ScheduledBlock{
+		BlockID:       1,
+		Name:          "test block",
+		ScheduleStart: "08:00",
+		ScheduleEnd:   "17:00",
+		ScheduleDays:  []string{},
+		ScheduleTimezone: time.UTC,
 	}
-	if isScheduleActive(dev) {
+	if isBlockActive(block, time.UTC) {
 		t.Error("empty schedule days should never be active")
 	}
 }
 
-func TestSchedule_WithinWindow(t *testing.T) {
-	// Force a known time by using a fixed location matching our test time
-	// We test the overnight-range logic directly since we can't mock time.Now()
+func TestSchedule_OvernightDetection(t *testing.T) {
 	// Test the overnight range: 22:00 to 06:00
-	dev := &cache.DeviceInfo{
-		SecondaryProfileID: 2,
-		ScheduleStart:      "22:00",
-		ScheduleEnd:        "06:00",
-		ScheduleDays:       []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
-		ScheduleTimezone:   time.UTC,
+	block := &cache.ScheduledBlock{
+		BlockID:       1,
+		Name:          "bedtime",
+		ScheduleStart: "22:00",
+		ScheduleEnd:   "06:00",
+		ScheduleDays:  []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
+		ScheduleTimezone: time.UTC,
 	}
 	// Can't inject time.Now() without refactoring, but we can test the logic
 	// by verifying overnight vs normal range detection
@@ -271,7 +274,7 @@ func TestSchedule_WithinWindow(t *testing.T) {
 	if endMins >= startMins {
 		t.Error("22:00-06:00 should be detected as overnight (end < start)")
 	}
-	_ = dev
+	_ = block
 }
 
 // Test parseHHMM
@@ -306,5 +309,140 @@ func TestMatchDomain(t *testing.T) {
 	}
 	if matchDomain("com", set) != "" {
 		t.Error("TLD should not match example.com rule")
+	}
+}
+
+// --- Scheduled block integration tests ---
+
+func TestScheduledBlock_BlockKeysMerged(t *testing.T) {
+	uid := "5555555555555555555555555555555a"
+	dev := makeDevice(uid, 1)
+	// Add a scheduled block that adds the "gambling" category - always active
+	dev.ScheduledBlocks = []cache.ScheduledBlock{
+		{
+			BlockID:          1,
+			Name:             "school hours",
+			ScheduleStart:    "00:00",
+			ScheduleEnd:      "23:59",
+			ScheduleDays:     []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
+			ScheduleTimezone: time.UTC,
+			BlockKeys:        []string{"gambling"},
+			AllowKeys:        nil,
+			CustomBlocked:    map[string]bool{},
+			CustomAllowed:    map[string]bool{},
+		},
+	}
+	c := makeCache(
+		map[string]*cache.DeviceInfo{uid: dev},
+		map[int64]*cache.ProfileInfo{1: makeProfile(1, nil, nil, []string{"ads"})},
+		map[string]map[string]bool{
+			"ads":      {"adserver.com": true},
+			"gambling": {"casino.com": true},
+		},
+	)
+	res := makeResolver(c)
+
+	// casino.com should be blocked via the scheduled block adding the gambling category
+	result := res.Resolve(uid, makeQuery("casino.com"))
+	if result.Result != ResultBlocked {
+		t.Errorf("expected BLOCKED for casino.com via scheduled block, got %s/%s", result.Result, result.Reason)
+	}
+
+	// adserver.com should still be blocked via base profile
+	result = res.Resolve(uid, makeQuery("adserver.com"))
+	if result.Result != ResultBlocked {
+		t.Errorf("expected BLOCKED for adserver.com via base profile, got %s/%s", result.Result, result.Reason)
+	}
+}
+
+func TestScheduledBlock_CustomDomainBlock(t *testing.T) {
+	uid := "6666666666666666666666666666666a"
+	dev := makeDevice(uid, 1)
+	dev.ScheduledBlocks = []cache.ScheduledBlock{
+		{
+			BlockID:          1,
+			Name:             "focus time",
+			ScheduleStart:    "00:00",
+			ScheduleEnd:      "23:59",
+			ScheduleDays:     []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
+			ScheduleTimezone: time.UTC,
+			BlockKeys:        nil,
+			AllowKeys:        nil,
+			CustomBlocked:    map[string]bool{"distraction.com": true},
+			CustomAllowed:    map[string]bool{},
+		},
+	}
+	c := makeCache(
+		map[string]*cache.DeviceInfo{uid: dev},
+		map[int64]*cache.ProfileInfo{1: makeProfile(1, nil, nil, nil)},
+		nil,
+	)
+	res := makeResolver(c)
+
+	result := res.Resolve(uid, makeQuery("distraction.com"))
+	if result.Result != ResultBlocked || result.Reason != ReasonCustomBlockRule {
+		t.Errorf("expected BLOCKED/custom_block_rule for scheduled block domain, got %s/%s", result.Result, result.Reason)
+	}
+}
+
+func TestScheduledBlock_AllowKeyRemovesCategory(t *testing.T) {
+	uid := "7777777777777777777777777777777a"
+	dev := makeDevice(uid, 1)
+	// Base profile blocks "social_media", but the scheduled block allows it
+	dev.ScheduledBlocks = []cache.ScheduledBlock{
+		{
+			BlockID:          1,
+			Name:             "free time",
+			ScheduleStart:    "00:00",
+			ScheduleEnd:      "23:59",
+			ScheduleDays:     []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
+			ScheduleTimezone: time.UTC,
+			BlockKeys:        nil,
+			AllowKeys:        []string{"social_media"},
+			CustomBlocked:    map[string]bool{},
+			CustomAllowed:    map[string]bool{},
+		},
+	}
+	c := makeCache(
+		map[string]*cache.DeviceInfo{uid: dev},
+		map[int64]*cache.ProfileInfo{1: makeProfile(1, nil, nil, []string{"social_media"})},
+		map[string]map[string]bool{"social_media": {"facebook.com": true}},
+	)
+	res := makeResolver(c)
+
+	// facebook.com should NOT be blocked because the scheduled block allows social_media
+	result := res.Resolve(uid, makeQuery("facebook.com"))
+	if result.Result == ResultBlocked {
+		t.Error("scheduled block allow key should remove social_media category -- facebook.com must not be BLOCKED")
+	}
+}
+
+func TestScheduledBlock_ActiveBlockNames(t *testing.T) {
+	uid := "8888888888888888888888888888888a"
+	dev := makeDevice(uid, 1)
+	dev.ScheduledBlocks = []cache.ScheduledBlock{
+		{
+			BlockID:          1,
+			Name:             "school hours",
+			ScheduleStart:    "00:00",
+			ScheduleEnd:      "23:59",
+			ScheduleDays:     []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
+			ScheduleTimezone: time.UTC,
+			BlockKeys:        nil,
+			AllowKeys:        nil,
+			CustomBlocked:    map[string]bool{"blocked.com": true},
+			CustomAllowed:    map[string]bool{},
+		},
+	}
+	c := makeCache(
+		map[string]*cache.DeviceInfo{uid: dev},
+		map[int64]*cache.ProfileInfo{1: makeProfile(1, nil, nil, nil)},
+		nil,
+	)
+	res := makeResolver(c)
+	result := res.Resolve(uid, makeQuery("blocked.com"))
+
+	if len(result.ActiveScheduledBlocks) != 1 || result.ActiveScheduledBlocks[0] != "school hours" {
+		t.Errorf("expected ActiveScheduledBlocks=[school hours], got %v", result.ActiveScheduledBlocks)
 	}
 }

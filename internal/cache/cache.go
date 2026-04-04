@@ -10,20 +10,28 @@ import (
 	"scrolldaddy-dns/internal/logger"
 )
 
-// DeviceInfo holds the in-memory representation of a device.
-type DeviceInfo struct {
-	DeviceID           int64
-	ResolverUID        string
-	PrimaryProfileID   int64
-	SecondaryProfileID int64 // 0 if no secondary profile
-	IsActive           bool
-	Timezone           *time.Location
-
-	// Schedule (evaluated against secondary profile's schedule fields)
+// ScheduledBlock holds the in-memory representation of a scheduled block and its rules.
+type ScheduledBlock struct {
+	BlockID          int64
+	Name             string
 	ScheduleStart    string   // "HH:MM"
 	ScheduleEnd      string   // "HH:MM"
 	ScheduleDays     []string // ["mon","tue","wed"]
 	ScheduleTimezone *time.Location
+	BlockKeys        []string        // filter/service keys with action=0 (block)
+	AllowKeys        []string        // filter/service keys with action=1 (allow)
+	CustomBlocked    map[string]bool // domain rules with action=0
+	CustomAllowed    map[string]bool // domain rules with action=1
+}
+
+// DeviceInfo holds the in-memory representation of a device.
+type DeviceInfo struct {
+	DeviceID         int64
+	ResolverUID      string
+	PrimaryProfileID int64
+	IsActive         bool
+	Timezone         *time.Location
+	ScheduledBlocks  []ScheduledBlock
 }
 
 // ProfileInfo holds the in-memory representation of a filtering profile.
@@ -52,9 +60,9 @@ type CacheStats struct {
 type Cache struct {
 	mu sync.RWMutex
 
-	devices          map[string]*DeviceInfo     // resolver_uid → DeviceInfo
-	profiles         map[int64]*ProfileInfo     // profile_id → ProfileInfo
-	blocklistDomains map[string]map[string]bool // category_key → domain set (shared across profiles)
+	devices          map[string]*DeviceInfo     // resolver_uid -> DeviceInfo
+	profiles         map[int64]*ProfileInfo     // profile_id -> ProfileInfo
+	blocklistDomains map[string]map[string]bool // category_key -> domain set (shared across profiles)
 
 	lastLightReload      time.Time
 	lastFullReload       time.Time
@@ -62,7 +70,7 @@ type Cache struct {
 	lastBlocklistVersion string // last scrolldaddy_blocklist_version seen
 
 	lsMu     sync.RWMutex
-	lastSeen map[string]time.Time // resolver_uid → last query time
+	lastSeen map[string]time.Time // resolver_uid -> last query time
 }
 
 // New creates an empty cache.
@@ -137,7 +145,7 @@ func (c *Cache) Stats() CacheStats {
 	}
 }
 
-// LightReload reloads devices, profiles, filters, and custom rules from the DB.
+// LightReload reloads devices, profiles, filters, custom rules, and scheduled blocks from the DB.
 // Does NOT reload blocklist domains (use FullReload for that).
 func (c *Cache) LightReload(database *db.DB) error {
 	deviceRows, err := database.LoadDevices()
@@ -160,13 +168,31 @@ func (c *Cache) LightReload(database *db.DB) error {
 		return fmt.Errorf("loading rules: %w", err)
 	}
 
+	// Load scheduled blocks and their rules
+	blockRows, err := database.LoadScheduledBlocks()
+	if err != nil {
+		return fmt.Errorf("loading scheduled blocks: %w", err)
+	}
+
+	blockFilterRules, err := database.LoadScheduledBlockFilterRules()
+	if err != nil {
+		return fmt.Errorf("loading scheduled block filter rules: %w", err)
+	}
+
+	blockServiceRules, err := database.LoadScheduledBlockServiceRules()
+	if err != nil {
+		return fmt.Errorf("loading scheduled block service rules: %w", err)
+	}
+
+	blockDomainRules, err := database.LoadScheduledBlockDomainRules()
+	if err != nil {
+		return fmt.Errorf("loading scheduled block domain rules: %w", err)
+	}
+
 	// Build profile map (collect all referenced profile IDs first)
 	profileIDs := map[int64]bool{}
 	for _, d := range deviceRows {
 		profileIDs[d.PrimaryProfileID] = true
-		if d.SecondaryProfileID.Valid {
-			profileIDs[d.SecondaryProfileID.Int64] = true
-		}
 	}
 
 	newProfiles := make(map[int64]*ProfileInfo, len(profileIDs))
@@ -201,6 +227,88 @@ func (c *Cache) LightReload(database *db.DB) error {
 		newProfiles[profileID] = pi
 	}
 
+	// Index scheduled block rules by block ID
+	blockFiltersByID := map[int64][]*db.ScheduledBlockRuleRow{}
+	for _, r := range blockFilterRules {
+		blockFiltersByID[r.BlockID] = append(blockFiltersByID[r.BlockID], r)
+	}
+	blockServicesByID := map[int64][]*db.ScheduledBlockRuleRow{}
+	for _, r := range blockServiceRules {
+		blockServicesByID[r.BlockID] = append(blockServicesByID[r.BlockID], r)
+	}
+	blockDomainsByID := map[int64][]*db.ScheduledBlockRuleRow{}
+	for _, r := range blockDomainRules {
+		blockDomainsByID[r.BlockID] = append(blockDomainsByID[r.BlockID], r)
+	}
+
+	// Build scheduled blocks grouped by device ID
+	blocksByDevice := map[int64][]ScheduledBlock{}
+	for _, b := range blockRows {
+		sb := ScheduledBlock{
+			BlockID:       b.BlockID,
+			Name:          b.Name,
+			ScheduleStart: b.ScheduleStart.String,
+			ScheduleEnd:   b.ScheduleEnd.String,
+			ScheduleDays:  db.ParseScheduleDays(b.ScheduleDays),
+			CustomBlocked: map[string]bool{},
+			CustomAllowed: map[string]bool{},
+		}
+
+		// Parse schedule timezone
+		if b.ScheduleTimezone.Valid && b.ScheduleTimezone.String != "" {
+			loc, err := time.LoadLocation(b.ScheduleTimezone.String)
+			if err != nil {
+				logger.Warn("scheduled block %d: invalid timezone %q, using UTC", b.BlockID, b.ScheduleTimezone.String)
+				loc = time.UTC
+			}
+			sb.ScheduleTimezone = loc
+		}
+		// Note: nil ScheduleTimezone will fall back to device timezone in resolver
+
+		// Partition filter rules by action
+		for _, r := range blockFiltersByID[b.BlockID] {
+			if r.Action == 0 {
+				sb.BlockKeys = append(sb.BlockKeys, r.Key)
+			} else {
+				sb.AllowKeys = append(sb.AllowKeys, r.Key)
+			}
+		}
+
+		// Partition service rules by action; also expand block services to domains
+		for _, r := range blockServicesByID[b.BlockID] {
+			if r.Action == 0 {
+				sb.BlockKeys = append(sb.BlockKeys, r.Key)
+				// Expand service to its domains and add to CustomBlocked
+				if domains, ok := ServiceDomains[r.Key]; ok {
+					for _, domain := range domains {
+						sb.CustomBlocked[strings.ToLower(domain)] = true
+					}
+				}
+			} else {
+				sb.AllowKeys = append(sb.AllowKeys, r.Key)
+				// Expand service to its domains and add to CustomAllowed
+				// so it overrides any base-profile service blocks for those domains
+				if domains, ok := ServiceDomains[r.Key]; ok {
+					for _, domain := range domains {
+						sb.CustomAllowed[strings.ToLower(domain)] = true
+					}
+				}
+			}
+		}
+
+		// Partition domain rules by action
+		for _, r := range blockDomainsByID[b.BlockID] {
+			domain := strings.ToLower(strings.TrimSpace(r.Key))
+			if r.Action == 0 {
+				sb.CustomBlocked[domain] = true
+			} else {
+				sb.CustomAllowed[domain] = true
+			}
+		}
+
+		blocksByDevice[b.DeviceID] = append(blocksByDevice[b.DeviceID], sb)
+	}
+
 	// Build device map, also setting SafeSearch/SafeYouTube on profile infos
 	newDevices := make(map[string]*DeviceInfo, len(deviceRows))
 	for _, d := range deviceRows {
@@ -216,24 +324,7 @@ func (c *Cache) LightReload(database *db.DB) error {
 			PrimaryProfileID: d.PrimaryProfileID,
 			IsActive:         d.IsActive,
 			Timezone:         loc,
-		}
-
-		if d.SecondaryProfileID.Valid {
-			di.SecondaryProfileID = d.SecondaryProfileID.Int64
-			di.ScheduleStart = d.ScheduleStart.String
-			di.ScheduleEnd = d.ScheduleEnd.String
-			di.ScheduleDays = db.ParseScheduleDays(d.ScheduleDays)
-
-			if d.ScheduleTimezone.Valid && d.ScheduleTimezone.String != "" {
-				schedLoc, err := time.LoadLocation(d.ScheduleTimezone.String)
-				if err != nil {
-					logger.Warn("device %d: invalid schedule timezone %q, using UTC", d.DeviceID, d.ScheduleTimezone.String)
-					schedLoc = time.UTC
-				}
-				di.ScheduleTimezone = schedLoc
-			} else {
-				di.ScheduleTimezone = loc
-			}
+			ScheduledBlocks:  blocksByDevice[d.DeviceID],
 		}
 
 		// Set SafeSearch/SafeYouTube on the profile objects
@@ -243,16 +334,6 @@ func (c *Cache) LightReload(database *db.DB) error {
 			}
 			if d.PrimarySafeYouTube.Valid {
 				pri.SafeYouTube = d.PrimarySafeYouTube.Bool
-			}
-		}
-		if di.SecondaryProfileID != 0 {
-			if sec, ok := newProfiles[di.SecondaryProfileID]; ok {
-				if d.SecondarySafeSearch.Valid {
-					sec.SafeSearch = d.SecondarySafeSearch.Bool
-				}
-				if d.SecondarySafeYouTube.Valid {
-					sec.SafeYouTube = d.SecondarySafeYouTube.Bool
-				}
 			}
 		}
 
@@ -265,7 +346,11 @@ func (c *Cache) LightReload(database *db.DB) error {
 	c.lastLightReload = time.Now()
 	c.mu.Unlock()
 
-	logger.Info("lightweight reload complete: %d devices, %d profiles", len(newDevices), len(newProfiles))
+	totalBlocks := 0
+	for _, blocks := range blocksByDevice {
+		totalBlocks += len(blocks)
+	}
+	logger.Info("lightweight reload complete: %d devices, %d profiles, %d scheduled blocks", len(newDevices), len(newProfiles), totalBlocks)
 	return nil
 }
 

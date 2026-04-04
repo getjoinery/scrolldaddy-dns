@@ -37,14 +37,13 @@ const (
 
 // ResolveResult contains both the DNS response and diagnostic information.
 type ResolveResult struct {
-	DNSResponse     *dns.Msg
-	Result          string
-	Reason          string
-	Category        string // set when Reason == ReasonCategoryBlocklist
-	MatchedRule     string // set when a specific rule matched
-	ActiveProfileID int64
-	ProfileType     string // "primary" or "secondary"
-	ScheduleActive  bool
+	DNSResponse          *dns.Msg
+	Result               string
+	Reason               string
+	Category             string   // set when Reason == ReasonCategoryBlocklist
+	MatchedRule          string   // set when a specific rule matched
+	ActiveProfileID      int64
+	ActiveScheduledBlocks []string // names of currently active scheduled blocks
 }
 
 // Resolver handles DNS resolution with per-device filtering.
@@ -101,17 +100,8 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 		return r.refused(query, ReasonInactiveDevice)
 	}
 
-	// 2. Determine active profile
+	// 2. Load base profile
 	activeProfileID := device.PrimaryProfileID
-	profileType := "primary"
-	scheduleActive := false
-
-	if device.SecondaryProfileID != 0 && isScheduleActive(device) {
-		activeProfileID = device.SecondaryProfileID
-		profileType = "secondary"
-		scheduleActive = true
-	}
-
 	profile := r.cache.GetProfile(activeProfileID)
 	if profile == nil {
 		logger.Warn("device %d: profile %d not found in cache", device.DeviceID, activeProfileID)
@@ -123,15 +113,67 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 			Result:          ResultServFail,
 			Reason:          ReasonProfileNotFound,
 			ActiveProfileID: activeProfileID,
-			ProfileType:     profileType,
-			ScheduleActive:  scheduleActive,
 		}
 	}
 
+	// Build effective filtering sets starting from the base profile
+	effectiveCategories := make(map[string]bool, len(profile.EnabledCategories))
+	for _, cat := range profile.EnabledCategories {
+		effectiveCategories[cat] = true
+	}
+	effectiveCustomBlocked := make(map[string]bool, len(profile.CustomBlocked))
+	for k, v := range profile.CustomBlocked {
+		effectiveCustomBlocked[k] = v
+	}
+	effectiveCustomAllowed := make(map[string]bool, len(profile.CustomAllowed))
+	for k, v := range profile.CustomAllowed {
+		effectiveCustomAllowed[k] = v
+	}
+
+	// Evaluate scheduled blocks and merge active ones
+	allowKeysToRemove := map[string]bool{}
+	var activeBlockNames []string
+
+	for i := range device.ScheduledBlocks {
+		block := &device.ScheduledBlocks[i]
+		if !isBlockActive(block, device.Timezone) {
+			continue
+		}
+		activeBlockNames = append(activeBlockNames, block.Name)
+
+		// Merge block keys (categories to block)
+		for _, key := range block.BlockKeys {
+			effectiveCategories[key] = true
+		}
+
+		// Track allow keys (categories to remove)
+		for _, key := range block.AllowKeys {
+			allowKeysToRemove[key] = true
+		}
+
+		// Merge custom domain rules
+		for domain := range block.CustomBlocked {
+			effectiveCustomBlocked[domain] = true
+		}
+		for domain := range block.CustomAllowed {
+			effectiveCustomAllowed[domain] = true
+		}
+	}
+
+	// Remove allowed categories
+	for key := range allowKeysToRemove {
+		delete(effectiveCategories, key)
+	}
+
+	// Convert effective categories back to slice
+	effectiveCategorySlice := make([]string, 0, len(effectiveCategories))
+	for cat := range effectiveCategories {
+		effectiveCategorySlice = append(effectiveCategorySlice, cat)
+	}
+
 	base := &ResolveResult{
-		ActiveProfileID: activeProfileID,
-		ProfileType:     profileType,
-		ScheduleActive:  scheduleActive,
+		ActiveProfileID:       activeProfileID,
+		ActiveScheduledBlocks: activeBlockNames,
 	}
 
 	// 3. Extract query domain
@@ -147,7 +189,7 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 	domain := strings.ToLower(strings.TrimSuffix(query.Question[0].Name, "."))
 
 	// 4. Custom allow rules bypass all blocking
-	if matched := matchDomain(domain, profile.CustomAllowed); matched != "" {
+	if matched := matchDomain(domain, effectiveCustomAllowed); matched != "" {
 		resp, err := upstream.Forward(query, r.upstreamPrimary, r.upstreamSecondary)
 		if err != nil {
 			base.DNSResponse = servFail(query)
@@ -181,7 +223,7 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 	}
 
 	// 6a. Custom block rules
-	if matched := matchDomain(domain, profile.CustomBlocked); matched != "" {
+	if matched := matchDomain(domain, effectiveCustomBlocked); matched != "" {
 		resp := new(dns.Msg)
 		resp.SetRcode(query, dns.RcodeNameError)
 		resp.RecursionAvailable = true
@@ -193,7 +235,7 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 	}
 
 	// 6b. Category blocklists (first match wins)
-	for _, cat := range profile.EnabledCategories {
+	for _, cat := range effectiveCategorySlice {
 		if r.cache.IsDomainBlocked(domain, cat) {
 			resp := new(dns.Msg)
 			resp.SetRcode(query, dns.RcodeNameError)
@@ -221,42 +263,73 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 	return base
 }
 
-// isScheduleActive returns true if the device's secondary profile schedule is currently active.
-func isScheduleActive(device *cache.DeviceInfo) bool {
-	if len(device.ScheduleDays) == 0 || device.ScheduleStart == "" || device.ScheduleEnd == "" {
+// isBlockActive returns true if the given scheduled block's schedule is currently active.
+// loc is the device's timezone, used as fallback when the block has no explicit timezone.
+func isBlockActive(block *cache.ScheduledBlock, loc *time.Location) bool {
+	if len(block.ScheduleDays) == 0 || block.ScheduleStart == "" || block.ScheduleEnd == "" {
 		return false
 	}
 
-	loc := device.ScheduleTimezone
-	if loc == nil {
-		loc = time.UTC
+	tzLoc := block.ScheduleTimezone
+	if tzLoc == nil {
+		tzLoc = loc
+	}
+	if tzLoc == nil {
+		tzLoc = time.UTC
 	}
 
-	now := time.Now().In(loc)
-	// "mon", "tue", etc.
-	dayAbbr := strings.ToLower(now.Weekday().String()[:3])
+	now := time.Now().In(tzLoc)
+	todayAbbr := strings.ToLower(now.Weekday().String()[:3])
+	yesterday := now.AddDate(0, 0, -1)
+	yesterdayAbbr := strings.ToLower(yesterday.Weekday().String()[:3])
 
-	dayMatch := false
-	for _, d := range device.ScheduleDays {
-		if d == dayAbbr {
-			dayMatch = true
-			break
-		}
-	}
-	if !dayMatch {
-		return false
-	}
-
-	startH, startM := parseHHMM(device.ScheduleStart)
-	endH, endM := parseHHMM(device.ScheduleEnd)
+	startH, startM := parseHHMM(block.ScheduleStart)
+	endH, endM := parseHHMM(block.ScheduleEnd)
 	currentMins := now.Hour()*60 + now.Minute()
 	startMins := startH*60 + startM
 	endMins := endH*60 + endM
 
 	if endMins < startMins {
-		// Overnight: active if >= start OR < end
-		return currentMins >= startMins || currentMins < endMins
+		// Overnight schedule: e.g. 22:00-06:00
+		// Active if today is scheduled AND time >= start
+		todayMatch := false
+		for _, d := range block.ScheduleDays {
+			if d == todayAbbr {
+				todayMatch = true
+				break
+			}
+		}
+		if todayMatch && currentMins >= startMins {
+			return true
+		}
+
+		// Also active if yesterday was scheduled AND time < end (spillover)
+		yesterdayMatch := false
+		for _, d := range block.ScheduleDays {
+			if d == yesterdayAbbr {
+				yesterdayMatch = true
+				break
+			}
+		}
+		if yesterdayMatch && currentMins < endMins {
+			return true
+		}
+
+		return false
 	}
+
+	// Normal (same-day) schedule
+	todayMatch := false
+	for _, d := range block.ScheduleDays {
+		if d == todayAbbr {
+			todayMatch = true
+			break
+		}
+	}
+	if !todayMatch {
+		return false
+	}
+
 	return currentMins >= startMins && currentMins < endMins
 }
 
@@ -328,5 +401,5 @@ func servFail(query *dns.Msg) *dns.Msg {
 	return resp
 }
 
-// IsScheduleActive is exported for testing.
-var IsScheduleActive = isScheduleActive
+// IsBlockActive is exported for testing.
+var IsBlockActive = isBlockActive

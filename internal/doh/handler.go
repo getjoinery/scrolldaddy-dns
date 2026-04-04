@@ -185,13 +185,12 @@ func (h *Handler) test(w http.ResponseWriter, r *http.Request) {
 	result := h.resolver.Resolve(uid, query)
 
 	resp := map[string]interface{}{
-		"uid":              uid,
-		"domain":           domain,
-		"result":           result.Result,
-		"reason":           result.Reason,
-		"active_profile_id": result.ActiveProfileID,
-		"profile_type":     result.ProfileType,
-		"schedule_active":  result.ScheduleActive,
+		"uid":                     uid,
+		"domain":                  domain,
+		"result":                  result.Result,
+		"reason":                  result.Reason,
+		"active_profile_id":       result.ActiveProfileID,
+		"active_scheduled_blocks": result.ActiveScheduledBlocks,
 	}
 	if result.Category != "" {
 		resp["category"] = result.Category
