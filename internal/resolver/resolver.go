@@ -9,6 +9,7 @@ import (
 	"scrolldaddy-dns/internal/cache"
 	"scrolldaddy-dns/internal/dnscache"
 	"scrolldaddy-dns/internal/logger"
+	"scrolldaddy-dns/internal/querylog"
 	"scrolldaddy-dns/internal/upstream"
 )
 
@@ -51,6 +52,7 @@ type ResolveResult struct {
 type Resolver struct {
 	cache             *cache.Cache
 	dnsCache          *dnscache.Cache
+	queryLog          *querylog.Logger
 	upstreamPrimary   string
 	upstreamSecondary string
 }
@@ -83,32 +85,33 @@ var safeYouTubeRewrites = map[string]string{
 }
 
 // New creates a Resolver backed by the given cache and upstream servers.
-// dc may be nil to disable DNS response caching.
-func New(c *cache.Cache, dc *dnscache.Cache, primary, secondary string) *Resolver {
+// dc and ql may be nil to disable DNS response caching or query logging.
+func New(c *cache.Cache, dc *dnscache.Cache, ql *querylog.Logger, primary, secondary string) *Resolver {
 	return &Resolver{
 		cache:             c,
 		dnsCache:          dc,
+		queryLog:          ql,
 		upstreamPrimary:   primary,
 		upstreamSecondary: secondary,
 	}
 }
 
 // forwardWithCache checks the DNS response cache before forwarding to upstream.
-// On a cache miss it forwards and stores the response for future queries.
-func (r *Resolver) forwardWithCache(query *dns.Msg) (*dns.Msg, error) {
+// Returns the response, whether it was a cache hit, and any error.
+func (r *Resolver) forwardWithCache(query *dns.Msg) (*dns.Msg, bool, error) {
 	if r.dnsCache != nil {
 		if cached := r.dnsCache.Get(query); cached != nil {
-			return cached, nil
+			return cached, true, nil
 		}
 	}
 	resp, err := upstream.Forward(query, r.upstreamPrimary, r.upstreamSecondary)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if r.dnsCache != nil {
 		r.dnsCache.Set(query, resp)
 	}
-	return resp, nil
+	return resp, false, nil
 }
 
 // Resolve processes a DNS query for the given resolver UID and returns a ResolveResult.
@@ -212,7 +215,7 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 
 	// 4. Custom allow rules bypass all blocking
 	if matched := matchDomain(domain, effectiveCustomAllowed); matched != "" {
-		resp, err := r.forwardWithCache(query)
+		resp, cached, err := r.forwardWithCache(query)
 		if err != nil {
 			base.DNSResponse = servFail(query)
 			base.Result = ResultServFail
@@ -223,6 +226,7 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 		base.Result = ResultForwarded
 		base.Reason = ReasonCustomAllowRule
 		base.MatchedRule = matched
+		r.recordQuery(device, resolverUID, domain, query, base, cached)
 		return base
 	}
 
@@ -232,6 +236,7 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 			base.DNSResponse = r.buildCNAMEResponse(query, domain, target)
 			base.Result = ResultForwarded
 			base.Reason = ReasonSafeSearchRewrite
+			r.recordQuery(device, resolverUID, domain, query, base, false)
 			return base
 		}
 	}
@@ -240,6 +245,7 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 			base.DNSResponse = r.buildCNAMEResponse(query, domain, target)
 			base.Result = ResultForwarded
 			base.Reason = ReasonSafeYouTubeRewrite
+			r.recordQuery(device, resolverUID, domain, query, base, false)
 			return base
 		}
 	}
@@ -253,6 +259,7 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 		base.Result = ResultBlocked
 		base.Reason = ReasonCustomBlockRule
 		base.MatchedRule = matched
+		r.recordQuery(device, resolverUID, domain, query, base, false)
 		return base
 	}
 
@@ -266,12 +273,13 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 			base.Result = ResultBlocked
 			base.Reason = ReasonCategoryBlocklist
 			base.Category = cat
+			r.recordQuery(device, resolverUID, domain, query, base, false)
 			return base
 		}
 	}
 
 	// 7. Forward to upstream (via cache)
-	resp, err := r.forwardWithCache(query)
+	resp, cached, err := r.forwardWithCache(query)
 	if err != nil {
 		base.DNSResponse = servFail(query)
 		base.Result = ResultServFail
@@ -282,7 +290,31 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 	base.DNSResponse = resp
 	base.Result = ResultForwarded
 	base.Reason = ReasonNotBlocked
+	r.recordQuery(device, resolverUID, domain, query, base, cached)
 	return base
+}
+
+// recordQuery sends a query log entry if logging is enabled for the device.
+func (r *Resolver) recordQuery(device *cache.DeviceInfo, uid, domain string, query *dns.Msg, result *ResolveResult, cached bool) {
+	if !device.LogQueries || r.queryLog == nil {
+		return
+	}
+	qtype := "UNKNOWN"
+	if len(query.Question) > 0 {
+		if s, ok := dns.TypeToString[query.Question[0].Qtype]; ok {
+			qtype = s
+		}
+	}
+	r.queryLog.Record(&querylog.Entry{
+		ResolverUID: uid,
+		Time:        time.Now(),
+		Domain:      domain,
+		QType:       qtype,
+		Result:      result.Result,
+		Reason:      result.Reason,
+		Category:    result.Category,
+		Cached:      cached,
+	})
 }
 
 // isBlockActive returns true if the given scheduled block's schedule is currently active.
@@ -401,7 +433,7 @@ func (r *Resolver) buildCNAMEResponse(query *dns.Msg, domain, target string) *dn
 	// Resolve the CNAME target to get A/AAAA records (via cache)
 	targetQuery := new(dns.Msg)
 	targetQuery.SetQuestion(dns.Fqdn(target), query.Question[0].Qtype)
-	targetResp, err := r.forwardWithCache(targetQuery)
+	targetResp, _, err := r.forwardWithCache(targetQuery)
 	if err == nil && targetResp != nil {
 		resp.Answer = append(resp.Answer, targetResp.Answer...)
 	}

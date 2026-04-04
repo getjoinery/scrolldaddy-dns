@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"scrolldaddy-dns/internal/db"
 	"scrolldaddy-dns/internal/dnscache"
 	"scrolldaddy-dns/internal/logger"
+	"scrolldaddy-dns/internal/querylog"
 	"scrolldaddy-dns/internal/resolver"
 )
 
@@ -23,17 +25,19 @@ type Handler struct {
 	resolver      *resolver.Resolver
 	cache         *cache.Cache
 	dnsCache      *dnscache.Cache
+	queryLog      *querylog.Logger
 	database      *db.DB
 	reloadTrigger chan struct{}
 	apiKey        string
 }
 
-// New creates a Handler. dc may be nil if the DNS response cache is disabled.
-func New(res *resolver.Resolver, c *cache.Cache, dc *dnscache.Cache, database *db.DB, reloadTrigger chan struct{}, apiKey string) *Handler {
+// New creates a Handler. dc and ql may be nil if features are disabled.
+func New(res *resolver.Resolver, c *cache.Cache, dc *dnscache.Cache, ql *querylog.Logger, database *db.DB, reloadTrigger chan struct{}, apiKey string) *Handler {
 	return &Handler{
 		resolver:      res,
 		cache:         c,
 		dnsCache:      dc,
+		queryLog:      ql,
 		database:      database,
 		reloadTrigger: reloadTrigger,
 		apiKey:        apiKey,
@@ -49,6 +53,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /stats", localhostOnly(h.stats))
 	mux.HandleFunc("POST /reload", h.requireAPIKey(h.reload))
 	mux.HandleFunc("POST /cache/flush", h.requireAPIKey(h.cacheFlush))
+	mux.HandleFunc("GET /device/{uid}/log", h.requireAPIKey(h.deviceLog))
+	mux.HandleFunc("POST /device/{uid}/log/purge", h.requireAPIKey(h.deviceLogPurge))
 	mux.HandleFunc("GET /test", h.requireAPIKey(h.test))
 }
 
@@ -178,6 +184,59 @@ func (h *Handler) cacheFlush(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "flushed"})
+}
+
+// deviceLog returns the last N lines of a device's query log. API-key protected.
+func (h *Handler) deviceLog(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if !isValidUID(uid) {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+	if h.queryLog == nil {
+		http.Error(w, "Query logging is not enabled", http.StatusNotFound)
+		return
+	}
+
+	n := 100
+	if v := r.URL.Query().Get("lines"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			n = parsed
+		}
+	}
+
+	lines, err := h.queryLog.ReadTail(uid, n)
+	if err != nil {
+		http.Error(w, "Failed to read log", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	for _, line := range lines {
+		fmt.Fprintln(w, line)
+	}
+}
+
+// deviceLogPurge truncates a device's query log. API-key protected.
+func (h *Handler) deviceLogPurge(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if !isValidUID(uid) {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+	if h.queryLog == nil {
+		http.Error(w, "Query logging is not enabled", http.StatusNotFound)
+		return
+	}
+
+	if err := h.queryLog.Purge(uid); err != nil {
+		logger.Warn("query log purge failed for %s: %v", uid, err)
+		http.Error(w, "Failed to purge log", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "purged"})
 }
 
 // reload triggers an immediate full cache reload. Localhost only.

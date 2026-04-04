@@ -30,6 +30,7 @@ type DeviceInfo struct {
 	ResolverUID      string
 	PrimaryProfileID int64
 	IsActive         bool
+	LogQueries       bool
 	Timezone         *time.Location
 	ScheduledBlocks  []ScheduledBlock
 }
@@ -332,6 +333,7 @@ func (c *Cache) LightReload(database *db.DB) error {
 			ResolverUID:      d.ResolverUID,
 			PrimaryProfileID: d.PrimaryProfileID,
 			IsActive:         d.IsActive,
+			LogQueries:       d.LogQueries,
 			Timezone:         loc,
 			ScheduledBlocks:  blocksByDevice[d.DeviceID],
 		}

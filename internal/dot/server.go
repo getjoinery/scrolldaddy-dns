@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"scrolldaddy-dns/internal/cache"
 	"scrolldaddy-dns/internal/logger"
 	"scrolldaddy-dns/internal/resolver"
 )
@@ -17,7 +18,7 @@ import (
 // Server starts a DNS-over-TLS server on the given port.
 // Device identification is via SNI subdomain: {uid}.{baseDomain}
 // e.g. "a1b2c3d4.dns.scrolldaddy.app"
-func Server(port int, certFile, keyFile, baseDomain string, res *resolver.Resolver) error {
+func Server(port int, certFile, keyFile, baseDomain string, res *resolver.Resolver, c *cache.Cache) error {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return fmt.Errorf("loading TLS cert/key: %w", err)
@@ -44,12 +45,12 @@ func Server(port int, certFile, keyFile, baseDomain string, res *resolver.Resolv
 			logger.Warn("DoT accept error: %v", err)
 			continue
 		}
-		go handleConn(conn, baseDomain, res)
+		go handleConn(conn, baseDomain, res, c)
 	}
 }
 
 // handleConn manages a single DoT connection for its lifetime.
-func handleConn(conn net.Conn, baseDomain string, res *resolver.Resolver) {
+func handleConn(conn net.Conn, baseDomain string, res *resolver.Resolver, c *cache.Cache) {
 	defer conn.Close()
 
 	tlsConn, ok := conn.(*tls.Conn)
@@ -92,6 +93,7 @@ func handleConn(conn net.Conn, baseDomain string, res *resolver.Resolver) {
 			return
 		}
 
+		c.RecordQuery(uid)
 		result := res.Resolve(uid, &query)
 
 		packed, err := result.DNSResponse.Pack()

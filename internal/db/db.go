@@ -22,6 +22,7 @@ type DeviceRow struct {
 	PrimaryProfileID   int64
 	IsActive           bool
 	Timezone           string
+	LogQueries         bool
 	PrimarySafeSearch  sql.NullBool
 	PrimarySafeYouTube sql.NullBool
 }
@@ -90,6 +91,7 @@ func (db *DB) ValidateSchema() error {
 			"sdd_device_id", "sdd_resolver_uid",
 			"sdd_sdp_profile_id_primary", "sdd_sdp_profile_id_secondary",
 			"sdd_is_active", "sdd_timezone", "sdd_delete_time",
+			"sdd_log_queries",
 		},
 		"sdp_profiles": {
 			"sdp_profile_id", "sdp_schedule_start", "sdp_schedule_end",
@@ -184,6 +186,7 @@ func (db *DB) LoadDevices() ([]*DeviceRow, error) {
 			d.sdd_sdp_profile_id_primary,
 			COALESCE(d.sdd_is_active, false),
 			COALESCE(d.sdd_timezone, 'UTC'),
+			COALESCE(d.sdd_log_queries, false),
 			p1.sdp_safesearch,
 			p1.sdp_safeyoutube
 		FROM sdd_devices d
@@ -210,6 +213,7 @@ func (db *DB) LoadDevices() ([]*DeviceRow, error) {
 			&d.PrimaryProfileID,
 			&d.IsActive,
 			&d.Timezone,
+			&d.LogQueries,
 			&d.PrimarySafeSearch,
 			&d.PrimarySafeYouTube,
 		); err != nil {

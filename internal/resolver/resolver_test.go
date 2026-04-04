@@ -55,6 +55,7 @@ func makeResolver(c *cache.Cache) *Resolver {
 	return &Resolver{
 		cache:             c,
 		dnsCache:          nil, // DNS response cache disabled in unit tests
+		queryLog:          nil, // query logging disabled in unit tests
 		upstreamPrimary:   "127.0.0.1:0", // invalid port forces upstream failure
 		upstreamSecondary: "127.0.0.1:0",
 	}

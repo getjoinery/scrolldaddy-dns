@@ -15,6 +15,7 @@ import (
 	"scrolldaddy-dns/internal/doh"
 	"scrolldaddy-dns/internal/dot"
 	"scrolldaddy-dns/internal/logger"
+	"scrolldaddy-dns/internal/querylog"
 	"scrolldaddy-dns/internal/resolver"
 )
 
@@ -68,15 +69,34 @@ func main() {
 	}
 	logger.Info("initial cache load complete")
 
-	// 5. Create DNS response cache and resolver
-	var dc *dnscache.Cache
-	if cfg.DNSCacheSize > 0 {
-		dc = dnscache.New(cfg.DNSCacheSize)
-		logger.Info("DNS response cache enabled (max %d entries)", cfg.DNSCacheSize)
-	} else {
-		logger.Info("DNS response cache disabled (SCD_DNS_CACHE_SIZE=0)")
+	// 5. Load feature config (dns cache, query logging)
+	fc, err := config.LoadFeatureConfig(cfg.ConfigFile)
+	if err != nil {
+		log.Fatalf("FATAL config file: %v", err)
 	}
-	res := resolver.New(c, dc, cfg.UpstreamPrimary, cfg.UpstreamSecondary)
+	config.MergeEnvOverrides(fc)
+
+	// 5a. Create DNS response cache
+	var dc *dnscache.Cache
+	if fc.DNSCache.Enabled && fc.DNSCache.MaxSize > 0 {
+		dc = dnscache.New(fc.DNSCache.MaxSize)
+		logger.Info("DNS response cache enabled (max %d entries)", fc.DNSCache.MaxSize)
+	} else {
+		logger.Info("DNS response cache disabled")
+	}
+
+	// 5b. Create query logger
+	var ql *querylog.Logger
+	if fc.QueryLog.Enabled && fc.QueryLog.Dir != "" {
+		ql = querylog.New(fc.QueryLog.Dir, fc.QueryLog.BufferSize, fc.QueryLog.MaxFileSize)
+		defer ql.Close()
+		logger.Info("query logging enabled (dir=%s, buffer=%d, max_size=%d)",
+			fc.QueryLog.Dir, fc.QueryLog.BufferSize, fc.QueryLog.MaxFileSize)
+	} else {
+		logger.Info("query logging disabled")
+	}
+
+	res := resolver.New(c, dc, ql, cfg.UpstreamPrimary, cfg.UpstreamSecondary)
 
 	// 6. Start background reload goroutines
 	reloadTrigger := make(chan struct{}, 1)
@@ -85,7 +105,7 @@ func main() {
 
 	// 7. Start DoH server
 	errCh := make(chan error, 2)
-	handler := doh.New(res, c, dc, database, reloadTrigger, cfg.APIKey)
+	handler := doh.New(res, c, dc, ql, database, reloadTrigger, cfg.APIKey)
 	go func() {
 		if err := doh.Server(cfg.DoHPort, handler); err != nil {
 			errCh <- fmt.Errorf("DoH server: %w", err)
@@ -98,7 +118,7 @@ func main() {
 			logger.Warn("SCD_DOT_CERT_FILE set but SCD_DOT_BASE_DOMAIN is empty -- skipping DoT")
 		} else {
 			go func() {
-				if err := dot.Server(cfg.DoTPort, cfg.DoTCertFile, cfg.DoTKeyFile, cfg.DoTBaseDomain, res); err != nil {
+				if err := dot.Server(cfg.DoTPort, cfg.DoTCertFile, cfg.DoTKeyFile, cfg.DoTBaseDomain, res, c); err != nil {
 					// Non-fatal: DoH continues without DoT
 					logger.Warn("DoT server error (DoH continues): %v", err)
 				}
