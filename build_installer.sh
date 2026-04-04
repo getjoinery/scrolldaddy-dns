@@ -223,8 +223,30 @@ extract_payload() {
     local payload_line
     payload_line=$(awk '/^__PAYLOAD__$/{print NR+1; exit}' "$0")
     [ -n "$payload_line" ] || die "Payload marker not found — the installer file may be corrupt."
-    tail -n +"$payload_line" "$0" | base64 -d | tar xzf - -C "$STAGE_DIR"
+
+    # Write to a temp file so we can inspect paths before extracting
+    local tarball="${STAGE_DIR}/payload.tar.gz"
+    tail -n +"$payload_line" "$0" | base64 -d > "$tarball"
+
+    # Reject path traversal sequences before extracting as root
+    if tar tzf "$tarball" 2>/dev/null | grep -q '\.\.'; then
+        die "Payload contains path traversal sequences — installer may be corrupt or tampered with."
+    fi
+
+    tar xzf "$tarball" --no-overwrite-dir -C "$STAGE_DIR"
+    rm -f "$tarball"
     log_verbose "Payload extracted to $STAGE_DIR."
+}
+
+# ── Env file helpers ─────────────────────────────────────────────────────────
+
+# quote_env VALUE — wraps a value in double quotes for systemd EnvironmentFile
+# format, escaping embedded backslashes and double quotes.
+quote_env() {
+    local val="$1"
+    val="${val//\\/\\\\}"
+    val="${val//\"/\\\"}"
+    printf '"%s"' "$val"
 }
 
 # ── Env file writer ───────────────────────────────────────────────────────────
@@ -234,11 +256,11 @@ write_env_file() {
 # Written by installer v${INSTALLER_VERSION} on $(date -u '+%Y-%m-%d %H:%M UTC')
 
 # ── Database ──────────────────────────────────────────────────────────────────
-SCD_DB_HOST=${DB_HOST}
-SCD_DB_PORT=${DB_PORT}
-SCD_DB_NAME=${DB_NAME}
-SCD_DB_USER=${DB_USER}
-SCD_DB_PASSWORD=${DB_PASSWORD}
+SCD_DB_HOST=$(quote_env "${DB_HOST}")
+SCD_DB_PORT=$(quote_env "${DB_PORT}")
+SCD_DB_NAME=$(quote_env "${DB_NAME}")
+SCD_DB_USER=$(quote_env "${DB_USER}")
+SCD_DB_PASSWORD=$(quote_env "${DB_PASSWORD}")
 
 # ── Server Ports ──────────────────────────────────────────────────────────────
 # DoH: Caddy proxies HTTPS 443 → this port
@@ -246,9 +268,9 @@ SCD_DOH_PORT=8053
 SCD_DOT_PORT=853
 
 # ── DNS-over-TLS (leave blank to disable) ─────────────────────────────────────
-SCD_DOT_CERT_FILE=${DOT_CERT_FILE}
-SCD_DOT_KEY_FILE=${DOT_KEY_FILE}
-SCD_DOT_BASE_DOMAIN=${DOT_BASE_DOMAIN}
+SCD_DOT_CERT_FILE=$(quote_env "${DOT_CERT_FILE}")
+SCD_DOT_KEY_FILE=$(quote_env "${DOT_KEY_FILE}")
+SCD_DOT_BASE_DOMAIN=$(quote_env "${DOT_BASE_DOMAIN}")
 
 # ── Upstream DNS ──────────────────────────────────────────────────────────────
 SCD_UPSTREAM_PRIMARY=1.1.1.1:53
@@ -260,10 +282,10 @@ SCD_BLOCKLIST_RELOAD_INTERVAL=3600
 
 # ── API Key ───────────────────────────────────────────────────────────────────
 # Protects /reload, /cache/flush, /device/{uid}/log endpoints
-SCD_API_KEY=${API_KEY}
+SCD_API_KEY=$(quote_env "${API_KEY}")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-SCD_LOG_LEVEL=${LOG_LEVEL}
+SCD_LOG_LEVEL=$(quote_env "${LOG_LEVEL}")
 SCD_LOG_FILE=/var/log/scrolldaddy/dns.log
 ENV_EOF
     chown root:"$SERVICE_USER" "$ENV_FILE"
@@ -285,8 +307,21 @@ install_caddy() {
     fi
 
     apt-get install -y -q debian-keyring debian-archive-keyring apt-transport-https curl 2>/dev/null || true
+
+    local keyring="/usr/share/keyrings/caddy-stable-archive-keyring.gpg"
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+        | gpg --dearmor -o "$keyring"
+
+    # Verify fingerprint before trusting the key
+    local expected_fp="65760C51EDEA2017CEA2CA15155B6D79CA56EA34"
+    local got_fp
+    got_fp="$(gpg --no-default-keyring --keyring "$keyring" --fingerprint 2>/dev/null \
+        | grep -oE '([0-9A-F]{4} ){9}[0-9A-F]{4}' | head -1 | tr -d ' ')"
+    if [ "$got_fp" != "$expected_fp" ]; then
+        rm -f "$keyring"
+        die "Caddy GPG key fingerprint mismatch (got ${got_fp:-none}, expected ${expected_fp}). Aborting."
+    fi
+
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
         | tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null
     apt-get update -q
@@ -299,6 +334,11 @@ configure_caddy() {
     local domain="$1"
     local caddyfile="/etc/caddy/Caddyfile"
     local marker="# scrolldaddy-dns — managed by installer"
+
+    # Validate domain to prevent Caddyfile injection
+    if ! printf '%s' "$domain" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
+        die "Invalid domain '${domain}' — expected format: dns.example.com"
+    fi
 
     # Idempotent: already configured
     if grep -q "$marker" "$caddyfile" 2>/dev/null; then
@@ -394,8 +434,7 @@ interactive_setup() {
     read -r -p "  API key [Enter to auto-generate]: " api_key_input || true
     if [ -z "$api_key_input" ]; then
         API_KEY="$generated_key"
-        log "  Generated API key: ${API_KEY}"
-        log "  Save this — you will need it to call protected API endpoints."
+        log "  API key auto-generated (saved to ${ENV_FILE})."
     else
         API_KEY="$api_key_input"
     fi
@@ -532,11 +571,8 @@ do_install() {
         echo "   curl http://localhost:8053/health"
         echo "   systemctl status ${SERVICE_NAME}"
         echo ""
-        if [ -n "$API_KEY" ]; then
-            echo " API key: ${API_KEY}"
-            echo " (also saved in ${ENV_FILE})"
-            echo ""
-        fi
+        echo " API key: cat ${ENV_FILE} | grep SCD_API_KEY"
+        echo ""
     else
         echo "WARN: Service did not start within 15 seconds."
         echo "Check logs: journalctl -u ${SERVICE_NAME} --no-pager -n 30"
