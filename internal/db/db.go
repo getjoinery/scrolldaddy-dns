@@ -4,15 +4,27 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
 )
 
+// errWriter is where schema warnings are written. Points to stderr by default;
+// tests can redirect it to suppress output.
+var errWriter = os.Stderr
+
 // DB wraps the PostgreSQL connection.
 type DB struct {
 	conn *sql.DB
+
+	// Optional feature columns detected at startup via ValidateSchema.
+	// If a column is absent (older schema), the feature is silently disabled
+	// and the service continues running. Add new optional columns here as
+	// features are introduced, so the DNS server can be deployed before the
+	// web app has run its schema migration.
+	HasLogQueriesCol bool
 }
 
 // DeviceRow holds raw data from the device+profile join query.
@@ -83,15 +95,37 @@ func (db *DB) Close() {
 	db.conn.Close()
 }
 
-// ValidateSchema checks that all required tables and columns exist.
-// Returns a descriptive error listing every missing table/column.
+// columnExists reports whether a column exists in a table.
+func (db *DB) columnExists(table, column string) bool {
+	var n int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(*) FROM information_schema.columns WHERE table_name=$1 AND column_name=$2`,
+		table, column,
+	).Scan(&n)
+	return err == nil && n > 0
+}
+
+// ValidateSchema checks that all required tables and columns exist, and probes
+// for optional feature columns introduced in newer schema versions.
+//
+// Required columns: fatal if missing — the service cannot function without them.
+// Optional columns: if absent, the feature is disabled and a warning is logged.
+//   The query in LoadDevices adapts based on which optional columns are present,
+//   so the DNS server can be deployed before the web app has run its migration.
+//
+// When adding a new optional column:
+//   1. Add it to optionalCols below (not required).
+//   2. Add a HasXxxCol bool field to DB.
+//   3. Set it in the loop below.
+//   4. Use it in the relevant Load* method to build a conditional query.
 func (db *DB) ValidateSchema() error {
+	// logger is the package-level logger; import it here for warnings.
+	// We use fmt.Fprintf to stderr to avoid a circular import with logger package.
 	expected := map[string][]string{
 		"sdd_devices": {
 			"sdd_device_id", "sdd_resolver_uid",
 			"sdd_sdp_profile_id_primary", "sdd_sdp_profile_id_secondary",
 			"sdd_is_active", "sdd_timezone", "sdd_delete_time",
-			"sdd_log_queries",
 		},
 		"sdp_profiles": {
 			"sdp_profile_id", "sdp_schedule_start", "sdp_schedule_end",
@@ -164,6 +198,13 @@ func (db *DB) ValidateSchema() error {
 	if len(errs) > 0 {
 		return fmt.Errorf("schema validation failed:\n%s", strings.Join(errs, "\n"))
 	}
+
+	// Probe optional feature columns. Missing = feature disabled, not fatal.
+	db.HasLogQueriesCol = db.columnExists("sdd_devices", "sdd_log_queries")
+	if !db.HasLogQueriesCol {
+		fmt.Fprintf(errWriter, "WARN  sdd_devices.sdd_log_queries not found — per-device query logging disabled until schema is updated\n")
+	}
+
 	return nil
 }
 
@@ -179,14 +220,21 @@ func (db *DB) LoadDevices() ([]*DeviceRow, error) {
 		return nil, err
 	}
 
-	const query = `
+	// Build query conditionally: if the optional sdd_log_queries column is
+	// absent (older schema), substitute a literal false so the rest of the
+	// code path works unchanged.
+	logQueriesExpr := "false"
+	if db.HasLogQueriesCol {
+		logQueriesExpr = "COALESCE(d.sdd_log_queries, false)"
+	}
+	query := fmt.Sprintf(`
 		SELECT
 			d.sdd_device_id,
 			d.sdd_resolver_uid,
 			d.sdd_sdp_profile_id_primary,
 			COALESCE(d.sdd_is_active, false),
 			COALESCE(d.sdd_timezone, 'UTC'),
-			COALESCE(d.sdd_log_queries, false),
+			%s,
 			p1.sdp_safesearch,
 			p1.sdp_safeyoutube
 		FROM sdd_devices d
@@ -196,7 +244,7 @@ func (db *DB) LoadDevices() ([]*DeviceRow, error) {
 		  AND d.sdd_is_active = TRUE
 		  AND d.sdd_resolver_uid IS NOT NULL
 		  AND d.sdd_resolver_uid != ''
-	`
+	`, logQueriesExpr)
 
 	rows, err := tx.Query(query)
 	if err != nil {

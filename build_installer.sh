@@ -234,27 +234,34 @@ do_upgrade() {
     systemctl daemon-reload
     log_verbose "Updated service unit."
 
-    # Stop → swap → start
-    local was_running=false
-    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        was_running=true
-        log_verbose "Stopping ${SERVICE_NAME}..."
-        systemctl stop "$SERVICE_NAME"
-    fi
+    # Stop the service unconditionally — handles running, crash-looping, and
+    # already-stopped states. 'reset-failed' clears any failed state so
+    # is-enabled check works correctly and NRestarts resets to 0.
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
+    log_verbose "Stopped ${SERVICE_NAME}."
 
     install -m 755 -o root -g root "${STAGE_DIR}/scrolldaddy-dns" "$BINARY_PATH"
     log_verbose "Installed new binary: $BINARY_PATH"
 
-    if [ "$was_running" = true ]; then
+    # Only restart if the service is enabled (i.e. it was set up to run).
+    # This preserves a deliberate "installed but stopped for maintenance" state.
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
         systemctl start "$SERVICE_NAME"
 
-        # Wait up to 10 seconds for the service to become active
+        # Wait for the service to stabilise. We check both that it is active
+        # AND that NRestarts is 0 — a service can briefly appear "active"
+        # between crash-loop restarts, giving a false positive if we only
+        # checked is-active. reset-failed above ensures NRestarts starts at 0.
         local ok=false
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
             sleep 1
             if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-                ok=true
-                break
+                restarts="$(systemctl show "$SERVICE_NAME" --property=NRestarts --value 2>/dev/null || echo 1)"
+                if [ "${restarts}" = "0" ]; then
+                    ok=true
+                    break
+                fi
             fi
         done
 
@@ -270,8 +277,8 @@ do_upgrade() {
         fi
     else
         rm -f "${BINARY_PATH}.bak"
-        log "  Service was not running — binary replaced but not started."
-        log "  Start when ready: systemctl start ${SERVICE_NAME}"
+        log "  Service is not enabled — binary replaced but not started."
+        log "  Start when ready: systemctl enable --now ${SERVICE_NAME}"
     fi
 
     log ""
