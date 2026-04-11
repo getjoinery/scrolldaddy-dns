@@ -29,6 +29,7 @@ type Handler struct {
 	queryLog      *querylog.Logger
 	reloadTrigger chan struct{}
 	apiKey        string
+	peerURL       string // base URL of peer DNS server for log merging (blank = disabled)
 
 	dbMu     sync.RWMutex
 	database *db.DB // may be nil during fail_open startup
@@ -36,7 +37,9 @@ type Handler struct {
 
 // New creates a Handler. dc, ql, and database may be nil if features are disabled
 // or not yet available (fail_open startup). Call SetDatabase once connected.
-func New(res *resolver.Resolver, c *cache.Cache, dc *dnscache.Cache, ql *querylog.Logger, database *db.DB, reloadTrigger chan struct{}, apiKey string) *Handler {
+// peerURL is the base URL of a peer DNS server for cross-instance log merging
+// (e.g. "http://10.0.0.2:8053"). Leave blank to disable peer features.
+func New(res *resolver.Resolver, c *cache.Cache, dc *dnscache.Cache, ql *querylog.Logger, database *db.DB, reloadTrigger chan struct{}, apiKey string, peerURL string) *Handler {
 	return &Handler{
 		resolver:      res,
 		cache:         c,
@@ -45,6 +48,7 @@ func New(res *resolver.Resolver, c *cache.Cache, dc *dnscache.Cache, ql *querylo
 		database:      database,
 		reloadTrigger: reloadTrigger,
 		apiKey:        apiKey,
+		peerURL:       strings.TrimRight(peerURL, "/"),
 	}
 }
 
@@ -221,6 +225,8 @@ func (h *Handler) cacheFlush(w http.ResponseWriter, r *http.Request) {
 }
 
 // deviceLog returns the last N lines of a device's query log. API-key protected.
+// When a peer URL is configured and this is not already a peer request, fetches
+// the peer's logs and merges them chronologically with the local logs.
 func (h *Handler) deviceLog(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	if !isValidUID(uid) {
@@ -245,6 +251,15 @@ func (h *Handler) deviceLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Merge with peer logs if configured and this isn't already a peer request
+	isPeerReq := r.URL.Query().Get("peer") == "0"
+	if h.peerURL != "" && !isPeerReq {
+		peerLines := h.fetchPeerLog(uid, n)
+		if len(peerLines) > 0 {
+			lines = mergeLogLines(lines, peerLines, n)
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	for _, line := range lines {
 		fmt.Fprintln(w, line)
@@ -252,6 +267,8 @@ func (h *Handler) deviceLog(w http.ResponseWriter, r *http.Request) {
 }
 
 // deviceLogPurge truncates a device's query log. API-key protected.
+// When a peer URL is configured and this is not already a peer request,
+// also forwards the purge to the peer.
 func (h *Handler) deviceLogPurge(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	if !isValidUID(uid) {
@@ -267,6 +284,12 @@ func (h *Handler) deviceLogPurge(w http.ResponseWriter, r *http.Request) {
 		logger.Warn("query log purge failed for %s: %v", uid, err)
 		http.Error(w, "Failed to purge log", http.StatusInternalServerError)
 		return
+	}
+
+	// Forward purge to peer if configured and not a peer request
+	isPeerReq := r.URL.Query().Get("peer") == "0"
+	if h.peerURL != "" && !isPeerReq {
+		go h.forwardPeerPurge(uid)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -373,6 +396,108 @@ func localhostOnly(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// fetchPeerLog fetches query log lines from the peer server.
+// Returns nil on any error (timeout, unreachable, etc).
+func (h *Handler) fetchPeerLog(uid string, n int) []string {
+	url := fmt.Sprintf("%s/device/%s/log?lines=%d&peer=0", h.peerURL, uid, n)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		logger.Debug("peer log request build failed: %v", err)
+		return nil
+	}
+	if h.apiKey != "" {
+		req.Header.Set("X-API-Key", h.apiKey)
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Debug("peer log fetch failed for %s: %v", uid, err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		logger.Debug("peer log fetch returned %d for %s", resp.StatusCode, uid)
+		return nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB limit
+	if err != nil {
+		logger.Debug("peer log read failed for %s: %v", uid, err)
+		return nil
+	}
+
+	raw := strings.TrimSpace(string(body))
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, "\n")
+}
+
+// forwardPeerPurge sends a log purge request to the peer server.
+// Errors are logged but not propagated.
+func (h *Handler) forwardPeerPurge(uid string) {
+	url := fmt.Sprintf("%s/device/%s/log/purge?peer=0", h.peerURL, uid)
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		logger.Debug("peer purge request build failed: %v", err)
+		return
+	}
+	if h.apiKey != "" {
+		req.Header.Set("X-API-Key", h.apiKey)
+	}
+	req.Header.Set("Content-Length", "0")
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Debug("peer purge failed for %s: %v", uid, err)
+		return
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		logger.Debug("peer purge returned %d for %s", resp.StatusCode, uid)
+	}
+}
+
+// mergeLogLines merges two chronologically-ordered log line slices and returns
+// the last n lines. Lines are sorted by the RFC3339 timestamp prefix (the text
+// before the first tab character). Lines with unparseable timestamps sort last.
+func mergeLogLines(local, peer []string, n int) []string {
+	merged := make([]string, 0, len(local)+len(peer))
+	i, j := 0, 0
+	for i < len(local) && j < len(peer) {
+		tl := logTimestamp(local[i])
+		tp := logTimestamp(peer[j])
+		if tl <= tp {
+			merged = append(merged, local[i])
+			i++
+		} else {
+			merged = append(merged, peer[j])
+			j++
+		}
+	}
+	merged = append(merged, local[i:]...)
+	merged = append(merged, peer[j:]...)
+
+	if len(merged) > n {
+		merged = merged[len(merged)-n:]
+	}
+	return merged
+}
+
+// logTimestamp extracts the timestamp prefix from a tab-separated log line.
+// Returns the raw string up to the first tab, or a high-sort value for
+// lines without a tab (so they sort to the end).
+func logTimestamp(line string) string {
+	if idx := strings.IndexByte(line, '\t'); idx > 0 {
+		return line[:idx]
+	}
+	return "\xff"
 }
 
 // isValidUID checks that uid is exactly 32 lowercase hex characters.

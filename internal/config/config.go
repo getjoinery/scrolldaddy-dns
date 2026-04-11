@@ -33,7 +33,8 @@ type Config struct {
 	LogLevel string
 	LogFile  string
 
-	APIKey string
+	APIKey  string
+	PeerURL string
 }
 
 // FeatureConfig holds runtime-toggleable feature settings loaded from the
@@ -158,6 +159,7 @@ func Load() (*Config, error) {
 		LogLevel:                getEnv("SCD_LOG_LEVEL", "info"),
 		LogFile:                 getEnv("SCD_LOG_FILE", "stdout"),
 		APIKey:                  getEnv("SCD_API_KEY", ""),
+		PeerURL:                 getEnv("SCD_PEER_URL", ""),
 	}
 
 	if cfg.DBName == "" {

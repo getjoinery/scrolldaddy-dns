@@ -73,7 +73,7 @@ func main() {
 
 	// 3. Create DoH handler (database starts nil; SetDatabase called once connected)
 	errCh := make(chan error, 2)
-	handler := doh.New(res, c, dc, ql, nil, reloadTrigger, cfg.APIKey)
+	handler := doh.New(res, c, dc, ql, nil, reloadTrigger, cfg.APIKey, cfg.PeerURL)
 
 	// 4. Connect to DB and load cache.
 	//    fail_open:  start servers in passthrough mode immediately, load in background.
