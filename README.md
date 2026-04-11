@@ -91,6 +91,7 @@ Typically loaded from `/etc/scrolldaddy/scrolldaddy.env`.
 | `SCD_LOG_LEVEL` | `info` | — | Log verbosity: `debug`, `info`, `warn`, `error` |
 | `SCD_LOG_FILE` | `stdout` | — | Log destination: `stdout` or a file path |
 | `SCD_CONFIG_FILE` | `/etc/scrolldaddy/dns.json` | — | Path to JSON feature config file (see below) |
+| `SCD_PEER_URL` | — | — | Base URL of a peer DNS server for cross-instance log merging (e.g. `http://10.0.0.2:8053`). Leave blank for single-server mode. See [Multi-Server Deployment](#multi-server-deployment). |
 
 **Feature override env vars** (override values in the JSON config file):
 
@@ -153,8 +154,8 @@ All endpoints below require the `X-API-Key` header (or `?api_key=` query paramet
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/device/{uid}/seen` | Returns last time this UID made a DNS query. Response: `{"uid":"...","seen":true,"last_seen":"2026-01-01T12:00:00Z"}` or `{"seen":false,"last_seen":null}`. Last-seen is in-memory only — resets on service restart. |
-| `GET` | `/device/{uid}/log?lines=N` | Returns the last N lines (default 100) of the device's query log as plain text. Returns 404 if query logging is disabled. |
-| `POST` | `/device/{uid}/log/purge` | Truncates the device's query log file. Returns `{"status":"purged"}`. |
+| `GET` | `/device/{uid}/log?lines=N` | Returns the last N lines (default 100) of the device's query log as plain text. Returns 404 if query logging is disabled. When `SCD_PEER_URL` is configured, also fetches from the peer and merges chronologically. Add `?peer=0` to skip peer merging (used internally to prevent recursion). |
+| `POST` | `/device/{uid}/log/purge` | Truncates the device's query log file. Returns `{"status":"purged"}`. When `SCD_PEER_URL` is configured, also forwards the purge to the peer. |
 | `POST` | `/reload` | Triggers an immediate full cache reload (blocklist + device data) and re-reads the JSON feature config file. |
 | `POST` | `/cache/flush` | Flushes the DNS response cache. Subsequent queries go to upstream until the cache warms up again. |
 
@@ -364,6 +365,58 @@ tail -f /var/log/scrolldaddy/dns.log
 # Live query log for a specific device
 tail -f /var/log/scrolldaddy/queries/<resolver_uid>.log
 ```
+
+---
+
+## Multi-Server Deployment
+
+Two ScrollDaddy DNS instances can run on separate hosts for redundancy. If one server goes down, client DNS resolvers fail over to the other automatically. Both instances share the same PostgreSQL database and operate independently.
+
+### How failover works
+
+ScrollDaddy uses DoH (HTTPS) and DoT (TLS), not plain DNS on port 53. Failover relies on:
+
+- **Multiple A records** for the DoH/DoT hostname (e.g. `dns.scrolldaddy.app` resolves to both server IPs). Modern HTTPS/TLS clients implement Happy Eyeballs (RFC 8305), racing connections to both IPs with ~250ms stagger. This covers iOS, macOS, Chrome, Firefox, and Edge with near-instant failover.
+- **Multiple DNS server entries** for platforms that configure DNS by IP (Windows, routers). Users list both server IPs explicitly.
+- **Android DoT** resolves the hostname to multiple IPs and tries them sequentially (3-5 second failover).
+
+### Setup
+
+1. **Run the installer on the second server.** Point `SCD_DB_HOST` at the primary server's IP (both instances share one PostgreSQL).
+
+2. **Open PostgreSQL** on the primary for the secondary's IP:
+   ```
+   # pg_hba.conf
+   host    scrolldaddy    scrolldaddy_dns    <SECONDARY_IP>/32    scram-sha-256
+   ```
+
+3. **Set `SCD_PEER_URL`** on each server pointing at the other:
+   ```bash
+   # On primary:  SCD_PEER_URL=http://<SECONDARY_IP>:8053
+   # On secondary: SCD_PEER_URL=http://<PRIMARY_IP>:8053
+   ```
+
+4. **Open firewall** for peer API access (port 8053) between the two servers.
+
+5. **Publish two A records** for the DoH/DoT hostname, one per server IP.
+
+### What `SCD_PEER_URL` enables
+
+- **Log merging:** GET `/device/{uid}/log` fetches logs from both the local files and the peer, merges them chronologically, and returns the combined result. A `?peer=0` query parameter prevents recursive calls between servers.
+- **Purge forwarding:** POST `/device/{uid}/log/purge` also forwards the purge to the peer.
+
+There is zero impact on the query resolution path. Peer communication only happens on the infrequent log and purge API requests.
+
+When `SCD_PEER_URL` is blank (the default), all peer features are disabled and the server behaves exactly as a single-instance deployment.
+
+### What the Joinery plugin handles
+
+The ScrollDaddy plugin in Joinery handles the remaining multi-server concerns:
+
+- **Last seen during install:** Queries both servers for `/device/{uid}/seen` so the setup flow detects the device regardless of which server it resolved through.
+- **Blocklist reload:** Triggers `/reload` on both servers after downloading blocklist updates.
+- **Apple mobileconfig:** Includes a `ServerAddresses` array with both server IPs for optimal Happy Eyeballs failover.
+- **Setup instructions:** Shows platform-appropriate instructions with both server IPs (Windows, routers).
 
 ---
 
