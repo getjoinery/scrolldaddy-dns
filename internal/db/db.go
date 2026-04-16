@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -88,6 +89,13 @@ func Connect(host, port, dbname, user, password string) (*DB, error) {
 // Ping checks the database connection is alive.
 func (db *DB) Ping() error {
 	return db.conn.Ping()
+}
+
+// PingContext checks the database connection with a deadline. Callers should
+// always provide a short timeout so a half-open TCP connection can't wedge
+// the caller waiting for bytes that will never arrive.
+func (db *DB) PingContext(ctx context.Context) error {
+	return db.conn.PingContext(ctx)
 }
 
 // Close closes the database connection.

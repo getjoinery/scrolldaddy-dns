@@ -1,6 +1,7 @@
 package doh
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -19,6 +21,16 @@ import (
 	"scrolldaddy-dns/internal/logger"
 	"scrolldaddy-dns/internal/querylog"
 	"scrolldaddy-dns/internal/resolver"
+)
+
+// dbHealthCheckInterval is how often the background goroutine pings the DB.
+// dbHealthCheckTimeout is how long each ping is allowed to take before being
+// reported as unhealthy. Short timeout is essential: a half-open TCP connection
+// to the DB host (e.g. dropped by a firewall mid-session) will never naturally
+// error, and /health must not block waiting on it.
+const (
+	dbHealthCheckInterval = 5 * time.Second
+	dbHealthCheckTimeout  = 500 * time.Millisecond
 )
 
 // Handler holds all state needed by the DoH HTTP handlers.
@@ -33,6 +45,11 @@ type Handler struct {
 
 	dbMu     sync.RWMutex
 	database *db.DB // may be nil during fail_open startup
+
+	// dbHealthy is updated by a background goroutine that pings the DB with a
+	// bounded timeout. /health reads from this atomic and never calls Ping
+	// directly, so the endpoint cannot wedge even if the DB connection is stuck.
+	dbHealthy atomic.Bool
 }
 
 // New creates a Handler. dc, ql, and database may be nil if features are disabled
@@ -40,7 +57,7 @@ type Handler struct {
 // peerURL is the base URL of a peer DNS server for cross-instance log merging
 // (e.g. "http://10.0.0.2:8053"). Leave blank to disable peer features.
 func New(res *resolver.Resolver, c *cache.Cache, dc *dnscache.Cache, ql *querylog.Logger, database *db.DB, reloadTrigger chan struct{}, apiKey string, peerURL string) *Handler {
-	return &Handler{
+	h := &Handler{
 		resolver:      res,
 		cache:         c,
 		dnsCache:      dc,
@@ -50,6 +67,8 @@ func New(res *resolver.Resolver, c *cache.Cache, dc *dnscache.Cache, ql *querylo
 		apiKey:        apiKey,
 		peerURL:       strings.TrimRight(peerURL, "/"),
 	}
+	go h.dbHealthLoop()
+	return h
 }
 
 // SetDatabase updates the database connection used by the health endpoint.
@@ -58,6 +77,64 @@ func (h *Handler) SetDatabase(d *db.DB) {
 	h.dbMu.Lock()
 	h.database = d
 	h.dbMu.Unlock()
+	// Refresh health status immediately so /health reflects the new DB without
+	// waiting for the next tick.
+	h.checkDBHealth()
+}
+
+// dbHealthLoop runs for the lifetime of the process, periodically pinging the
+// database with a bounded timeout and updating h.dbHealthy. /health reads that
+// atomic instead of calling Ping itself, so a stuck DB connection cannot block
+// the HTTP handler — a deliberately separate goroutine absorbs the wait.
+//
+// Each check runs in its own goroutine so a single stuck Ping can never block
+// the next tick. The checkDBHealth implementation also races the Ping against
+// a hard cap so a driver that ignores context deadlines can't pin the atomic
+// to a stale value.
+func (h *Handler) dbHealthLoop() {
+	ticker := time.NewTicker(dbHealthCheckInterval)
+	defer ticker.Stop()
+	h.checkDBHealth() // prime the value before the first tick
+	for range ticker.C {
+		go h.checkDBHealth()
+	}
+}
+
+// checkDBHealth pings the current database with a short deadline and stores
+// the result in h.dbHealthy. Safe to call from any goroutine and guaranteed
+// to return within dbHealthCheckTimeout * 2, even if the driver ignores the
+// context deadline (lib/pq has historically been unreliable about this for
+// half-open TCP connections).
+func (h *Handler) checkDBHealth() {
+	h.dbMu.RLock()
+	database := h.database
+	h.dbMu.RUnlock()
+	if database == nil {
+		h.dbHealthy.Store(false)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dbHealthCheckTimeout)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- database.PingContext(ctx)
+	}()
+	select {
+	case err := <-done:
+		prev := h.dbHealthy.Swap(err == nil)
+		if err != nil && prev {
+			logger.Warn("db health check failed: %v", err)
+		} else if err == nil && !prev {
+			logger.Info("db health check recovered")
+		}
+	case <-time.After(dbHealthCheckTimeout * 2):
+		// Ping didn't honor the context deadline — still leaking a goroutine
+		// until the driver gives up, but we unblock and report unhealthy.
+		prev := h.dbHealthy.Swap(false)
+		if prev {
+			logger.Warn("db health check timed out past hard cap — reporting degraded")
+		}
+	}
 }
 
 // RegisterRoutes sets up all HTTP routes on the given mux.
@@ -168,9 +245,10 @@ func (h *Handler) handleDNSQuery(w http.ResponseWriter, uid string, data []byte)
 
 // health returns service health status. Open to all (no localhost restriction).
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
-	h.dbMu.RLock()
-	dbOK := h.database != nil && h.database.Ping() == nil
-	h.dbMu.RUnlock()
+	// Read DB status from the atomic updated by the background health loop.
+	// Never call Ping here — a stuck DB connection would block this handler
+	// indefinitely and in turn wedge every caller behind dbMu.RLock.
+	dbOK := h.dbHealthy.Load()
 	stats := h.cache.Stats()
 
 	status := "ok"
