@@ -273,7 +273,6 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	s := h.cache.Stats()
 	out := map[string]interface{}{
 		"devices":                 s.Devices,
-		"profiles":                s.Profiles,
 		"blocklist_categories":    s.BlocklistCategories,
 		"blocklist_domains_total": s.BlocklistDomains,
 		"last_light_reload":       s.LastLightReload.UTC().Format(time.RFC3339),
@@ -406,7 +405,6 @@ func (h *Handler) test(w http.ResponseWriter, r *http.Request) {
 		"domain":                  domain,
 		"result":                  result.Result,
 		"reason":                  result.Reason,
-		"active_profile_id":       result.ActiveProfileID,
 		"active_scheduled_blocks": result.ActiveScheduledBlocks,
 	}
 	if result.Category != "" {

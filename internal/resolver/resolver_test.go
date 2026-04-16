@@ -10,9 +10,9 @@ import (
 
 // --- Helpers ---
 
-func makeCache(devices map[string]*cache.DeviceInfo, profiles map[int64]*cache.ProfileInfo, blocklists map[string]map[string]bool) *cache.Cache {
+func makeCache(devices map[string]*cache.DeviceInfo, blocklists map[string]map[string]bool) *cache.Cache {
 	c := cache.New()
-	c.LoadForTest(devices, profiles, blocklists) // sets internal maps directly for testing
+	c.LoadForTest(devices, blocklists)
 	return c
 }
 
@@ -22,17 +22,19 @@ func makeQuery(domain string) *dns.Msg {
 	return m
 }
 
-func makeDevice(uid string, primaryID int64) *cache.DeviceInfo {
+// makeDevice returns a device with an always-on block carrying the given policy.
+func makeDevice(uid string, blocked, allowed, categories []string) *cache.DeviceInfo {
 	return &cache.DeviceInfo{
-		DeviceID:         1,
-		ResolverUID:      uid,
-		PrimaryProfileID: primaryID,
-		IsActive:         true,
-		Timezone:         time.UTC,
+		DeviceID:        1,
+		ResolverUID:     uid,
+		IsActive:        true,
+		Timezone:        time.UTC,
+		ScheduledBlocks: []cache.ScheduledBlock{makeAlwaysOnBlock(blocked, allowed, categories)},
 	}
 }
 
-func makeProfile(id int64, blocked, allowed []string, categories []string) *cache.ProfileInfo {
+// makeAlwaysOnBlock builds an always-on block that applies 24/7.
+func makeAlwaysOnBlock(blocked, allowed, categories []string) cache.ScheduledBlock {
 	cb := map[string]bool{}
 	for _, d := range blocked {
 		cb[d] = true
@@ -41,11 +43,13 @@ func makeProfile(id int64, blocked, allowed []string, categories []string) *cach
 	for _, d := range allowed {
 		ca[d] = true
 	}
-	return &cache.ProfileInfo{
-		ProfileID:         id,
-		EnabledCategories: categories,
-		CustomBlocked:     cb,
-		CustomAllowed:     ca,
+	return cache.ScheduledBlock{
+		BlockID:       1,
+		Name:          "Always-On Rules",
+		IsAlwaysOn:    true,
+		BlockKeys:     categories,
+		CustomBlocked: cb,
+		CustomAllowed: ca,
 	}
 }
 
@@ -64,7 +68,7 @@ func makeResolver(c *cache.Cache) *Resolver {
 // --- Tests ---
 
 func TestUnknownDevice(t *testing.T) {
-	c := makeCache(nil, nil, nil)
+	c := makeCache(nil, nil)
 	res := makeResolver(c)
 	result := res.Resolve("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1", makeQuery("google.com"))
 	if result.Result != ResultRefused || result.Reason != ReasonUnknownDevice {
@@ -77,11 +81,10 @@ func TestUnknownDevice(t *testing.T) {
 
 func TestInactiveDevice(t *testing.T) {
 	uid := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	dev := makeDevice(uid, 1)
+	dev := makeDevice(uid, nil, nil, nil)
 	dev.IsActive = false
 	c := makeCache(
 		map[string]*cache.DeviceInfo{uid: dev},
-		map[int64]*cache.ProfileInfo{1: makeProfile(1, nil, nil, nil)},
 		nil,
 	)
 	res := makeResolver(c)
@@ -94,8 +97,7 @@ func TestInactiveDevice(t *testing.T) {
 func TestCustomBlockRule_ExactMatch(t *testing.T) {
 	uid := "cccccccccccccccccccccccccccccccc"
 	c := makeCache(
-		map[string]*cache.DeviceInfo{uid: makeDevice(uid, 1)},
-		map[int64]*cache.ProfileInfo{1: makeProfile(1, []string{"badsite.com"}, nil, nil)},
+		map[string]*cache.DeviceInfo{uid: makeDevice(uid, []string{"badsite.com"}, nil, nil)},
 		nil,
 	)
 	res := makeResolver(c)
@@ -111,8 +113,7 @@ func TestCustomBlockRule_ExactMatch(t *testing.T) {
 func TestCustomBlockRule_ParentDomain(t *testing.T) {
 	uid := "dddddddddddddddddddddddddddddddd"
 	c := makeCache(
-		map[string]*cache.DeviceInfo{uid: makeDevice(uid, 1)},
-		map[int64]*cache.ProfileInfo{1: makeProfile(1, []string{"badsite.com"}, nil, nil)},
+		map[string]*cache.DeviceInfo{uid: makeDevice(uid, []string{"badsite.com"}, nil, nil)},
 		nil,
 	)
 	res := makeResolver(c)
@@ -128,8 +129,7 @@ func TestCustomAllowRule_BypassesBlock(t *testing.T) {
 	// The key assertion is that it's NOT blocked. With our dummy upstream it
 	// will fail to forward and return SERVFAIL, but it must not return BLOCKED.
 	c := makeCache(
-		map[string]*cache.DeviceInfo{uid: makeDevice(uid, 1)},
-		map[int64]*cache.ProfileInfo{1: makeProfile(1, nil, []string{"example.com"}, []string{"testcat"})},
+		map[string]*cache.DeviceInfo{uid: makeDevice(uid, nil, []string{"example.com"}, []string{"testcat"})},
 		map[string]map[string]bool{"testcat": {"example.com": true}},
 	)
 	res := makeResolver(c)
@@ -142,8 +142,7 @@ func TestCustomAllowRule_BypassesBlock(t *testing.T) {
 func TestCategoryBlocklist(t *testing.T) {
 	uid := "ffffffffffffffffffffffffffffffff"
 	c := makeCache(
-		map[string]*cache.DeviceInfo{uid: makeDevice(uid, 1)},
-		map[int64]*cache.ProfileInfo{1: makeProfile(1, nil, nil, []string{"ads"})},
+		map[string]*cache.DeviceInfo{uid: makeDevice(uid, nil, nil, []string{"ads"})},
 		map[string]map[string]bool{"ads": {"doubleclick.net": true}},
 	)
 	res := makeResolver(c)
@@ -159,8 +158,7 @@ func TestCategoryBlocklist(t *testing.T) {
 func TestCategoryBlocklist_AllQueryTypesBlocked(t *testing.T) {
 	uid := "1111111111111111111111111111111a"
 	c := makeCache(
-		map[string]*cache.DeviceInfo{uid: makeDevice(uid, 1)},
-		map[int64]*cache.ProfileInfo{1: makeProfile(1, nil, nil, []string{"ads"})},
+		map[string]*cache.DeviceInfo{uid: makeDevice(uid, nil, nil, []string{"ads"})},
 		map[string]map[string]bool{"ads": {"blocked.com": true}},
 	)
 	res := makeResolver(c)
@@ -178,8 +176,7 @@ func TestCategoryBlocklist_AllQueryTypesBlocked(t *testing.T) {
 func TestNoQuestion(t *testing.T) {
 	uid := "2222222222222222222222222222222a"
 	c := makeCache(
-		map[string]*cache.DeviceInfo{uid: makeDevice(uid, 1)},
-		map[int64]*cache.ProfileInfo{1: makeProfile(1, nil, nil, nil)},
+		map[string]*cache.DeviceInfo{uid: makeDevice(uid, nil, nil, nil)},
 		nil,
 	)
 	res := makeResolver(c)
@@ -194,8 +191,7 @@ func TestNoQuestion(t *testing.T) {
 func TestDNSResponseFlags(t *testing.T) {
 	uid := "3333333333333333333333333333333a"
 	c := makeCache(
-		map[string]*cache.DeviceInfo{uid: makeDevice(uid, 1)},
-		map[int64]*cache.ProfileInfo{1: makeProfile(1, []string{"blocked.com"}, nil, nil)},
+		map[string]*cache.DeviceInfo{uid: makeDevice(uid, []string{"blocked.com"}, nil, nil)},
 		nil,
 	)
 	res := makeResolver(c)
@@ -228,7 +224,6 @@ func TestDNSResponseFlags(t *testing.T) {
 func TestSchedule_NoBlocks_NothingActive(t *testing.T) {
 	dev := &cache.DeviceInfo{
 		ResolverUID:      "4444444444444444444444444444444a",
-		PrimaryProfileID: 1,
 		IsActive:         true,
 		Timezone:         time.UTC,
 		ScheduledBlocks:  nil, // no scheduled blocks
@@ -318,25 +313,22 @@ func TestMatchDomain(t *testing.T) {
 
 func TestScheduledBlock_BlockKeysMerged(t *testing.T) {
 	uid := "5555555555555555555555555555555a"
-	dev := makeDevice(uid, 1)
-	// Add a scheduled block that adds the "gambling" category - always active
-	dev.ScheduledBlocks = []cache.ScheduledBlock{
-		{
-			BlockID:          1,
-			Name:             "school hours",
-			ScheduleStart:    "00:00",
-			ScheduleEnd:      "23:59",
-			ScheduleDays:     []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
-			ScheduleTimezone: time.UTC,
-			BlockKeys:        []string{"gambling"},
-			AllowKeys:        nil,
-			CustomBlocked:    map[string]bool{},
-			CustomAllowed:    map[string]bool{},
-		},
-	}
+	// Always-on baseline carries "ads" category; scheduled block adds "gambling"
+	dev := makeDevice(uid, nil, nil, []string{"ads"})
+	dev.ScheduledBlocks = append(dev.ScheduledBlocks, cache.ScheduledBlock{
+		BlockID:          2,
+		Name:             "school hours",
+		ScheduleStart:    "00:00",
+		ScheduleEnd:      "23:59",
+		ScheduleDays:     []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
+		ScheduleTimezone: time.UTC,
+		BlockKeys:        []string{"gambling"},
+		AllowKeys:        nil,
+		CustomBlocked:    map[string]bool{},
+		CustomAllowed:    map[string]bool{},
+	})
 	c := makeCache(
 		map[string]*cache.DeviceInfo{uid: dev},
-		map[int64]*cache.ProfileInfo{1: makeProfile(1, nil, nil, []string{"ads"})},
 		map[string]map[string]bool{
 			"ads":      {"adserver.com": true},
 			"gambling": {"casino.com": true},
@@ -359,24 +351,21 @@ func TestScheduledBlock_BlockKeysMerged(t *testing.T) {
 
 func TestScheduledBlock_CustomDomainBlock(t *testing.T) {
 	uid := "6666666666666666666666666666666a"
-	dev := makeDevice(uid, 1)
-	dev.ScheduledBlocks = []cache.ScheduledBlock{
-		{
-			BlockID:          1,
-			Name:             "focus time",
-			ScheduleStart:    "00:00",
-			ScheduleEnd:      "23:59",
-			ScheduleDays:     []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
-			ScheduleTimezone: time.UTC,
-			BlockKeys:        nil,
-			AllowKeys:        nil,
-			CustomBlocked:    map[string]bool{"distraction.com": true},
-			CustomAllowed:    map[string]bool{},
-		},
-	}
+	dev := makeDevice(uid, nil, nil, nil)
+	dev.ScheduledBlocks = append(dev.ScheduledBlocks, cache.ScheduledBlock{
+		BlockID:          2,
+		Name:             "focus time",
+		ScheduleStart:    "00:00",
+		ScheduleEnd:      "23:59",
+		ScheduleDays:     []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
+		ScheduleTimezone: time.UTC,
+		BlockKeys:        nil,
+		AllowKeys:        nil,
+		CustomBlocked:    map[string]bool{"distraction.com": true},
+		CustomAllowed:    map[string]bool{},
+	})
 	c := makeCache(
 		map[string]*cache.DeviceInfo{uid: dev},
-		map[int64]*cache.ProfileInfo{1: makeProfile(1, nil, nil, nil)},
 		nil,
 	)
 	res := makeResolver(c)
@@ -389,25 +378,22 @@ func TestScheduledBlock_CustomDomainBlock(t *testing.T) {
 
 func TestScheduledBlock_AllowKeyRemovesCategory(t *testing.T) {
 	uid := "7777777777777777777777777777777a"
-	dev := makeDevice(uid, 1)
-	// Base profile blocks "social_media", but the scheduled block allows it
-	dev.ScheduledBlocks = []cache.ScheduledBlock{
-		{
-			BlockID:          1,
-			Name:             "free time",
-			ScheduleStart:    "00:00",
-			ScheduleEnd:      "23:59",
-			ScheduleDays:     []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
-			ScheduleTimezone: time.UTC,
-			BlockKeys:        nil,
-			AllowKeys:        []string{"social_media"},
-			CustomBlocked:    map[string]bool{},
-			CustomAllowed:    map[string]bool{},
-		},
-	}
+	// Always-on baseline blocks "social_media"; scheduled block allows it
+	dev := makeDevice(uid, nil, nil, []string{"social_media"})
+	dev.ScheduledBlocks = append(dev.ScheduledBlocks, cache.ScheduledBlock{
+		BlockID:          2,
+		Name:             "free time",
+		ScheduleStart:    "00:00",
+		ScheduleEnd:      "23:59",
+		ScheduleDays:     []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
+		ScheduleTimezone: time.UTC,
+		BlockKeys:        nil,
+		AllowKeys:        []string{"social_media"},
+		CustomBlocked:    map[string]bool{},
+		CustomAllowed:    map[string]bool{},
+	})
 	c := makeCache(
 		map[string]*cache.DeviceInfo{uid: dev},
-		map[int64]*cache.ProfileInfo{1: makeProfile(1, nil, nil, []string{"social_media"})},
 		map[string]map[string]bool{"social_media": {"facebook.com": true}},
 	)
 	res := makeResolver(c)
@@ -421,30 +407,36 @@ func TestScheduledBlock_AllowKeyRemovesCategory(t *testing.T) {
 
 func TestScheduledBlock_ActiveBlockNames(t *testing.T) {
 	uid := "8888888888888888888888888888888a"
-	dev := makeDevice(uid, 1)
-	dev.ScheduledBlocks = []cache.ScheduledBlock{
-		{
-			BlockID:          1,
-			Name:             "school hours",
-			ScheduleStart:    "00:00",
-			ScheduleEnd:      "23:59",
-			ScheduleDays:     []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
-			ScheduleTimezone: time.UTC,
-			BlockKeys:        nil,
-			AllowKeys:        nil,
-			CustomBlocked:    map[string]bool{"blocked.com": true},
-			CustomAllowed:    map[string]bool{},
-		},
-	}
+	// Always-on baseline is empty; only the scheduled block carries a rule.
+	dev := makeDevice(uid, nil, nil, nil)
+	dev.ScheduledBlocks = append(dev.ScheduledBlocks, cache.ScheduledBlock{
+		BlockID:          2,
+		Name:             "school hours",
+		ScheduleStart:    "00:00",
+		ScheduleEnd:      "23:59",
+		ScheduleDays:     []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
+		ScheduleTimezone: time.UTC,
+		BlockKeys:        nil,
+		AllowKeys:        nil,
+		CustomBlocked:    map[string]bool{"blocked.com": true},
+		CustomAllowed:    map[string]bool{},
+	})
 	c := makeCache(
 		map[string]*cache.DeviceInfo{uid: dev},
-		map[int64]*cache.ProfileInfo{1: makeProfile(1, nil, nil, nil)},
 		nil,
 	)
 	res := makeResolver(c)
 	result := res.Resolve(uid, makeQuery("blocked.com"))
 
-	if len(result.ActiveScheduledBlocks) != 1 || result.ActiveScheduledBlocks[0] != "school hours" {
-		t.Errorf("expected ActiveScheduledBlocks=[school hours], got %v", result.ActiveScheduledBlocks)
+	// Both the always-on block and "school hours" will be reported as active.
+	hasSchoolHours := false
+	for _, name := range result.ActiveScheduledBlocks {
+		if name == "school hours" {
+			hasSchoolHours = true
+			break
+		}
+	}
+	if !hasSchoolHours {
+		t.Errorf("expected ActiveScheduledBlocks to include 'school hours', got %v", result.ActiveScheduledBlocks)
 	}
 }

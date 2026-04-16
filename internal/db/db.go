@@ -28,30 +28,23 @@ type DB struct {
 	HasLogQueriesCol bool
 }
 
-// DeviceRow holds raw data from the device+profile join query.
+// DeviceRow holds raw data from the device query.
 type DeviceRow struct {
-	DeviceID           int64
-	ResolverUID        string
-	PrimaryProfileID   int64
-	IsActive           bool
-	Timezone           string
-	LogQueries         bool
-	PrimarySafeSearch  sql.NullBool
-	PrimarySafeYouTube sql.NullBool
-}
-
-// RuleRow holds a single custom DNS rule.
-type RuleRow struct {
-	ProfileID int64
-	Hostname  string
-	Action    int // 0=block, 1=allow
+	DeviceID    int64
+	ResolverUID string
+	IsActive    bool
+	Timezone    string
+	LogQueries  bool
 }
 
 // ScheduledBlockRow holds raw data from the scheduled blocks query.
+// An always-on block (IsAlwaysOn=true) has no schedule and is active 24/7;
+// the resolver short-circuits isBlockActive() when this is set.
 type ScheduledBlockRow struct {
 	BlockID          int64
 	DeviceID         int64
 	Name             string
+	IsAlwaysOn       bool
 	ScheduleStart    sql.NullString
 	ScheduleEnd      sql.NullString
 	ScheduleDays     sql.NullString
@@ -132,28 +125,14 @@ func (db *DB) ValidateSchema() error {
 	expected := map[string][]string{
 		"sdd_devices": {
 			"sdd_device_id", "sdd_resolver_uid",
-			"sdd_sdp_profile_id_primary", "sdd_sdp_profile_id_secondary",
 			"sdd_is_active", "sdd_timezone", "sdd_delete_time",
-		},
-		"sdp_profiles": {
-			"sdp_profile_id", "sdp_schedule_start", "sdp_schedule_end",
-			"sdp_schedule_days", "sdp_schedule_timezone",
-			"sdp_safesearch", "sdp_safeyoutube",
-		},
-		"sdf_filters": {
-			"sdf_sdp_profile_id", "sdf_filter_key", "sdf_is_active",
-		},
-		"sdr_rules": {
-			"sdr_sdp_profile_id", "sdr_hostname", "sdr_action", "sdr_is_active",
-		},
-		"sds_services": {
-			"sds_sdp_profile_id", "sds_service_key", "sds_is_active",
 		},
 		"bld_blocklist_domains": {
 			"bld_category_key", "bld_domain",
 		},
 		"sdb_scheduled_blocks": {
 			"sdb_scheduled_block_id", "sdb_sdd_device_id", "sdb_name",
+			"sdb_is_always_on",
 			"sdb_schedule_start", "sdb_schedule_end", "sdb_schedule_days",
 			"sdb_schedule_timezone", "sdb_is_active", "sdb_delete_time",
 		},
@@ -239,15 +218,10 @@ func (db *DB) LoadDevices() ([]*DeviceRow, error) {
 		SELECT
 			d.sdd_device_id,
 			d.sdd_resolver_uid,
-			d.sdd_sdp_profile_id_primary,
 			COALESCE(d.sdd_is_active, false),
 			COALESCE(d.sdd_timezone, 'UTC'),
-			%s,
-			p1.sdp_safesearch,
-			p1.sdp_safeyoutube
+			%s
 		FROM sdd_devices d
-		JOIN sdp_profiles p1
-			ON d.sdd_sdp_profile_id_primary = p1.sdp_profile_id
 		WHERE d.sdd_delete_time IS NULL
 		  AND d.sdd_is_active = TRUE
 		  AND d.sdd_resolver_uid IS NOT NULL
@@ -266,12 +240,9 @@ func (db *DB) LoadDevices() ([]*DeviceRow, error) {
 		if err := rows.Scan(
 			&d.DeviceID,
 			&d.ResolverUID,
-			&d.PrimaryProfileID,
 			&d.IsActive,
 			&d.Timezone,
 			&d.LogQueries,
-			&d.PrimarySafeSearch,
-			&d.PrimarySafeYouTube,
 		); err != nil {
 			return nil, err
 		}
@@ -283,93 +254,6 @@ func (db *DB) LoadDevices() ([]*DeviceRow, error) {
 
 	tx.Commit()
 	return devices, nil
-}
-
-// LoadFilters loads all active filter assignments, keyed by profile ID.
-// Note: sdf_sdp_profile_id is varchar in the schema but stores integer values.
-func (db *DB) LoadFilters() (map[int64][]string, error) {
-	const query = `
-		SELECT
-			sdf_sdp_profile_id::bigint AS profile_id,
-			sdf_filter_key AS category_key
-		FROM sdf_filters
-		WHERE sdf_is_active = 1
-		  AND sdf_sdp_profile_id ~ '^[0-9]+$'
-	`
-	rows, err := db.conn.Query(query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	result := map[int64][]string{}
-	for rows.Next() {
-		var profileID int64
-		var categoryKey string
-		if err := rows.Scan(&profileID, &categoryKey); err != nil {
-			return nil, err
-		}
-		result[profileID] = append(result[profileID], categoryKey)
-	}
-	return result, rows.Err()
-}
-
-// LoadRules loads all active custom rules, keyed by profile ID.
-// Note: sdr_sdp_profile_id is varchar in the schema but stores integer values.
-func (db *DB) LoadRules() (map[int64][]*RuleRow, error) {
-	const query = `
-		SELECT
-			sdr_sdp_profile_id::bigint AS profile_id,
-			sdr_hostname AS hostname,
-			sdr_action AS action
-		FROM sdr_rules
-		WHERE sdr_is_active = 1
-		  AND sdr_sdp_profile_id ~ '^[0-9]+$'
-	`
-	rows, err := db.conn.Query(query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	result := map[int64][]*RuleRow{}
-	for rows.Next() {
-		r := &RuleRow{}
-		if err := rows.Scan(&r.ProfileID, &r.Hostname, &r.Action); err != nil {
-			return nil, err
-		}
-		result[r.ProfileID] = append(result[r.ProfileID], r)
-	}
-	return result, rows.Err()
-}
-
-// LoadServices loads all active service assignments, keyed by profile ID.
-// Note: sds_sdp_profile_id is varchar in the schema but stores integer values.
-func (db *DB) LoadServices() (map[int64][]string, error) {
-	const query = `
-		SELECT
-			sds_sdp_profile_id::bigint AS profile_id,
-			sds_service_key AS service_key
-		FROM sds_services
-		WHERE sds_is_active = 1
-		  AND sds_sdp_profile_id ~ '^[0-9]+$'
-	`
-	rows, err := db.conn.Query(query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	result := map[int64][]string{}
-	for rows.Next() {
-		var profileID int64
-		var serviceKey string
-		if err := rows.Scan(&profileID, &serviceKey); err != nil {
-			return nil, err
-		}
-		result[profileID] = append(result[profileID], serviceKey)
-	}
-	return result, rows.Err()
 }
 
 // LoadBlocklistDomains streams all blocklist domains from the DB.
@@ -411,12 +295,15 @@ func (db *DB) GetBlocklistVersion() string {
 }
 
 // LoadScheduledBlocks loads all active, non-deleted scheduled blocks.
+// Always-on blocks (sdb_is_always_on = true) have no schedule and are treated as
+// always-active by the resolver. Every device has exactly one.
 func (db *DB) LoadScheduledBlocks() ([]*ScheduledBlockRow, error) {
 	const query = `
 		SELECT
 			sdb_scheduled_block_id,
 			sdb_sdd_device_id,
 			COALESCE(sdb_name, ''),
+			COALESCE(sdb_is_always_on, false),
 			sdb_schedule_start,
 			sdb_schedule_end,
 			sdb_schedule_days,
@@ -438,6 +325,7 @@ func (db *DB) LoadScheduledBlocks() ([]*ScheduledBlockRow, error) {
 			&b.BlockID,
 			&b.DeviceID,
 			&b.Name,
+			&b.IsAlwaysOn,
 			&b.ScheduleStart,
 			&b.ScheduleEnd,
 			&b.ScheduleDays,

@@ -24,10 +24,15 @@ const (
 )
 
 // Reason codes for ResolveResult.
+// Filter keys on a scheduled block that trigger rewrites rather than category blocks.
+const (
+	FilterKeySafeSearch  = "safesearch"
+	FilterKeySafeYouTube = "safeyoutube"
+)
+
 const (
 	ReasonUnknownDevice    = "unknown_device"
 	ReasonInactiveDevice   = "inactive_device"
-	ReasonProfileNotFound  = "profile_not_found"
 	ReasonNoQuestion       = "no_question"
 	ReasonCustomBlockRule  = "custom_block_rule"
 	ReasonCustomAllowRule  = "custom_allow_rule"
@@ -40,12 +45,11 @@ const (
 
 // ResolveResult contains both the DNS response and diagnostic information.
 type ResolveResult struct {
-	DNSResponse          *dns.Msg
-	Result               string
-	Reason               string
-	Category             string   // set when Reason == ReasonCategoryBlocklist
-	MatchedRule          string   // set when a specific rule matched
-	ActiveProfileID      int64
+	DNSResponse           *dns.Msg
+	Result                string
+	Reason                string
+	Category              string   // set when Reason == ReasonCategoryBlocklist
+	MatchedRule           string   // set when a specific rule matched
 	ActiveScheduledBlocks []string // names of currently active scheduled blocks
 }
 
@@ -176,37 +180,14 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 		return r.refused(query, ReasonInactiveDevice)
 	}
 
-	// 2. Load base profile
-	activeProfileID := device.PrimaryProfileID
-	profile := r.cache.GetProfile(activeProfileID)
-	if profile == nil {
-		logger.Warn("device %d: profile %d not found in cache", device.DeviceID, activeProfileID)
-		resp := new(dns.Msg)
-		resp.SetRcode(query, dns.RcodeServerFailure)
-		resp.RecursionAvailable = true
-		return &ResolveResult{
-			DNSResponse:     resp,
-			Result:          ResultServFail,
-			Reason:          ReasonProfileNotFound,
-			ActiveProfileID: activeProfileID,
-		}
-	}
-
-	// Build effective filtering sets starting from the base profile
-	effectiveCategories := make(map[string]bool, len(profile.EnabledCategories))
-	for _, cat := range profile.EnabledCategories {
-		effectiveCategories[cat] = true
-	}
-	effectiveCustomBlocked := make(map[string]bool, len(profile.CustomBlocked))
-	for k, v := range profile.CustomBlocked {
-		effectiveCustomBlocked[k] = v
-	}
-	effectiveCustomAllowed := make(map[string]bool, len(profile.CustomAllowed))
-	for k, v := range profile.CustomAllowed {
-		effectiveCustomAllowed[k] = v
-	}
-
-	// Evaluate scheduled blocks and merge active ones
+	// 2. Build effective filtering sets by merging every active block's policy.
+	// All filtering policy now lives on blocks — the always-on block (IsAlwaysOn=true)
+	// replaces what used to be profile-level filters/services/rules.
+	effectiveCategories := map[string]bool{}
+	effectiveCustomBlocked := map[string]bool{}
+	effectiveCustomAllowed := map[string]bool{}
+	effectiveSafeSearch := false
+	effectiveSafeYouTube := false
 	allowKeysToRemove := map[string]bool{}
 	var activeBlockNames []string
 
@@ -217,14 +198,30 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 		}
 		activeBlockNames = append(activeBlockNames, block.Name)
 
-		// Merge block keys (categories to block)
+		// Merge block keys (categories to block). SafeSearch/SafeYouTube are filter keys
+		// that trigger rewrites rather than blocks; split them out.
 		for _, key := range block.BlockKeys {
-			effectiveCategories[key] = true
+			switch key {
+			case FilterKeySafeSearch:
+				effectiveSafeSearch = true
+			case FilterKeySafeYouTube:
+				effectiveSafeYouTube = true
+			default:
+				effectiveCategories[key] = true
+			}
 		}
 
-		// Track allow keys (categories to remove)
+		// Track allow keys (categories to remove). Allow on safesearch/safeyoutube
+		// means explicitly disabling the rewrite during this block.
 		for _, key := range block.AllowKeys {
-			allowKeysToRemove[key] = true
+			switch key {
+			case FilterKeySafeSearch:
+				effectiveSafeSearch = false
+			case FilterKeySafeYouTube:
+				effectiveSafeYouTube = false
+			default:
+				allowKeysToRemove[key] = true
+			}
 		}
 
 		// Merge custom domain rules
@@ -248,7 +245,6 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 	}
 
 	base := &ResolveResult{
-		ActiveProfileID:       activeProfileID,
 		ActiveScheduledBlocks: activeBlockNames,
 	}
 
@@ -281,8 +277,8 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 		return base
 	}
 
-	// 5. SafeSearch / SafeYouTube CNAME rewrites
-	if profile.SafeSearch {
+	// 5. SafeSearch / SafeYouTube CNAME rewrites — triggered by filter keys on active blocks.
+	if effectiveSafeSearch {
 		if target, ok := safeSearchRewrites[domain]; ok {
 			base.DNSResponse = r.buildCNAMEResponse(query, domain, target)
 			base.Result = ResultForwarded
@@ -291,7 +287,7 @@ func (r *Resolver) Resolve(resolverUID string, query *dns.Msg) *ResolveResult {
 			return base
 		}
 	}
-	if profile.SafeYouTube {
+	if effectiveSafeYouTube {
 		if target, ok := safeYouTubeRewrites[domain]; ok {
 			base.DNSResponse = r.buildCNAMEResponse(query, domain, target)
 			base.Result = ResultForwarded
@@ -371,6 +367,10 @@ func (r *Resolver) recordQuery(device *cache.DeviceInfo, uid, domain string, que
 // isBlockActive returns true if the given scheduled block's schedule is currently active.
 // loc is the device's timezone, used as fallback when the block has no explicit timezone.
 func isBlockActive(block *cache.ScheduledBlock, loc *time.Location) bool {
+	// Always-on blocks carry baseline policy and apply 24/7.
+	if block.IsAlwaysOn {
+		return true
+	}
 	if len(block.ScheduleDays) == 0 || block.ScheduleStart == "" || block.ScheduleEnd == "" {
 		return false
 	}

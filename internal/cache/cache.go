@@ -10,13 +10,16 @@ import (
 	"scrolldaddy-dns/internal/logger"
 )
 
-// ScheduledBlock holds the in-memory representation of a scheduled block and its rules.
+// ScheduledBlock holds the in-memory representation of a block (scheduled or always-on)
+// and its rules. Always-on blocks (IsAlwaysOn=true) have no schedule and are treated
+// as always-active by the resolver.
 type ScheduledBlock struct {
 	BlockID          int64
 	Name             string
-	ScheduleStart    string   // "HH:MM"
-	ScheduleEnd      string   // "HH:MM"
-	ScheduleDays     []string // ["mon","tue","wed"]
+	IsAlwaysOn       bool
+	ScheduleStart    string   // "HH:MM" (empty if IsAlwaysOn)
+	ScheduleEnd      string   // "HH:MM" (empty if IsAlwaysOn)
+	ScheduleDays     []string // ["mon","tue","wed"] (nil if IsAlwaysOn)
 	ScheduleTimezone *time.Location
 	BlockKeys        []string        // filter/service keys with action=0 (block)
 	AllowKeys        []string        // filter/service keys with action=1 (allow)
@@ -26,29 +29,17 @@ type ScheduledBlock struct {
 
 // DeviceInfo holds the in-memory representation of a device.
 type DeviceInfo struct {
-	DeviceID         int64
-	ResolverUID      string
-	PrimaryProfileID int64
-	IsActive         bool
-	LogQueries       bool
-	Timezone         *time.Location
-	ScheduledBlocks  []ScheduledBlock
-}
-
-// ProfileInfo holds the in-memory representation of a filtering profile.
-type ProfileInfo struct {
-	ProfileID         int64
-	SafeSearch        bool
-	SafeYouTube       bool
-	EnabledCategories []string
-	CustomBlocked     map[string]bool
-	CustomAllowed     map[string]bool
+	DeviceID        int64
+	ResolverUID     string
+	IsActive        bool
+	LogQueries      bool
+	Timezone        *time.Location
+	ScheduledBlocks []ScheduledBlock
 }
 
 // CacheStats holds statistics for the /stats endpoint.
 type CacheStats struct {
 	Devices             int
-	Profiles            int
 	BlocklistCategories int
 	BlocklistDomains    int
 	LastLightReload     time.Time
@@ -62,8 +53,7 @@ type Cache struct {
 	mu sync.RWMutex
 
 	devices          map[string]*DeviceInfo     // resolver_uid -> DeviceInfo
-	profiles         map[int64]*ProfileInfo     // profile_id -> ProfileInfo
-	blocklistDomains map[string]map[string]bool // category_key -> domain set (shared across profiles)
+	blocklistDomains map[string]map[string]bool // category_key -> domain set (shared across devices)
 
 	lastLightReload      time.Time
 	lastFullReload       time.Time
@@ -78,7 +68,6 @@ type Cache struct {
 func New() *Cache {
 	return &Cache{
 		devices:          map[string]*DeviceInfo{},
-		profiles:         map[int64]*ProfileInfo{},
 		blocklistDomains: map[string]map[string]bool{},
 		startTime:        time.Now(),
 		lastSeen:         map[string]time.Time{},
@@ -108,13 +97,6 @@ func (c *Cache) GetDevice(resolverUID string) *DeviceInfo {
 	return c.devices[resolverUID]
 }
 
-// GetProfile returns the ProfileInfo for a profile ID, or nil if not found.
-func (c *Cache) GetProfile(profileID int64) *ProfileInfo {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.profiles[profileID]
-}
-
 // IsDomainBlocked checks if the domain (or any parent) is in the given category's blocklist.
 func (c *Cache) IsDomainBlocked(domain, categoryKey string) bool {
 	c.mu.RLock()
@@ -137,7 +119,6 @@ func (c *Cache) Stats() CacheStats {
 	}
 	return CacheStats{
 		Devices:             len(c.devices),
-		Profiles:            len(c.profiles),
 		BlocklistCategories: len(c.blocklistDomains),
 		BlocklistDomains:    totalDomains,
 		LastLightReload:     c.lastLightReload,
@@ -146,30 +127,18 @@ func (c *Cache) Stats() CacheStats {
 	}
 }
 
-// LightReload reloads devices, profiles, filters, custom rules, and scheduled blocks from the DB.
+// LightReload reloads devices and all scheduled/always-on blocks with their rules from the DB.
 // Does NOT reload blocklist domains (use FullReload for that).
+//
+// All filtering policy now lives on block rows (sdb_scheduled_blocks). An always-on
+// block (IsAlwaysOn=true) replaces what used to be profile-level filters/services/rules.
 func (c *Cache) LightReload(database *db.DB) error {
 	deviceRows, err := database.LoadDevices()
 	if err != nil {
 		return fmt.Errorf("loading devices: %w", err)
 	}
 
-	filterMap, err := database.LoadFilters()
-	if err != nil {
-		return fmt.Errorf("loading filters: %w", err)
-	}
-
-	serviceMap, err := database.LoadServices()
-	if err != nil {
-		return fmt.Errorf("loading services: %w", err)
-	}
-
-	ruleMap, err := database.LoadRules()
-	if err != nil {
-		return fmt.Errorf("loading rules: %w", err)
-	}
-
-	// Load scheduled blocks and their rules
+	// Load scheduled blocks and their rules (includes always-on blocks)
 	blockRows, err := database.LoadScheduledBlocks()
 	if err != nil {
 		return fmt.Errorf("loading scheduled blocks: %w", err)
@@ -188,46 +157,6 @@ func (c *Cache) LightReload(database *db.DB) error {
 	blockDomainRules, err := database.LoadScheduledBlockDomainRules()
 	if err != nil {
 		return fmt.Errorf("loading scheduled block domain rules: %w", err)
-	}
-
-	// Build profile map (collect all referenced profile IDs first)
-	profileIDs := map[int64]bool{}
-	for _, d := range deviceRows {
-		profileIDs[d.PrimaryProfileID] = true
-	}
-
-	newProfiles := make(map[int64]*ProfileInfo, len(profileIDs))
-	for profileID := range profileIDs {
-		pi := &ProfileInfo{
-			ProfileID:     profileID,
-			CustomBlocked: map[string]bool{},
-			CustomAllowed: map[string]bool{},
-		}
-		if cats, ok := filterMap[profileID]; ok {
-			pi.EnabledCategories = cats
-		}
-		if rules, ok := ruleMap[profileID]; ok {
-			for _, r := range rules {
-				domain := strings.ToLower(strings.TrimSpace(r.Hostname))
-				if r.Action == 0 {
-					pi.CustomBlocked[domain] = true
-				} else {
-					pi.CustomAllowed[domain] = true
-				}
-			}
-		}
-		// TODO(scaling): Same expansion issue as in the block service rules below —
-		// each profile gets its own copy of the expanded service domain maps.
-		if services, ok := serviceMap[profileID]; ok {
-			for _, svcKey := range services {
-				if domains, ok := ServiceDomains[svcKey]; ok {
-					for _, domain := range domains {
-						pi.CustomBlocked[strings.ToLower(domain)] = true
-					}
-				}
-			}
-		}
-		newProfiles[profileID] = pi
 	}
 
 	// Index scheduled block rules by block ID
@@ -250,6 +179,7 @@ func (c *Cache) LightReload(database *db.DB) error {
 		sb := ScheduledBlock{
 			BlockID:       b.BlockID,
 			Name:          b.Name,
+			IsAlwaysOn:    b.IsAlwaysOn,
 			ScheduleStart: b.ScheduleStart.String,
 			ScheduleEnd:   b.ScheduleEnd.String,
 			ScheduleDays:  db.ParseScheduleDays(b.ScheduleDays),
@@ -319,7 +249,7 @@ func (c *Cache) LightReload(database *db.DB) error {
 		blocksByDevice[b.DeviceID] = append(blocksByDevice[b.DeviceID], sb)
 	}
 
-	// Build device map, also setting SafeSearch/SafeYouTube on profile infos
+	// Build device map
 	newDevices := make(map[string]*DeviceInfo, len(deviceRows))
 	for _, d := range deviceRows {
 		loc, err := time.LoadLocation(d.Timezone)
@@ -329,23 +259,12 @@ func (c *Cache) LightReload(database *db.DB) error {
 		}
 
 		di := &DeviceInfo{
-			DeviceID:         d.DeviceID,
-			ResolverUID:      d.ResolverUID,
-			PrimaryProfileID: d.PrimaryProfileID,
-			IsActive:         d.IsActive,
-			LogQueries:       d.LogQueries,
-			Timezone:         loc,
-			ScheduledBlocks:  blocksByDevice[d.DeviceID],
-		}
-
-		// Set SafeSearch/SafeYouTube on the profile objects
-		if pri, ok := newProfiles[d.PrimaryProfileID]; ok {
-			if d.PrimarySafeSearch.Valid {
-				pri.SafeSearch = d.PrimarySafeSearch.Bool
-			}
-			if d.PrimarySafeYouTube.Valid {
-				pri.SafeYouTube = d.PrimarySafeYouTube.Bool
-			}
+			DeviceID:        d.DeviceID,
+			ResolverUID:     d.ResolverUID,
+			IsActive:        d.IsActive,
+			LogQueries:      d.LogQueries,
+			Timezone:        loc,
+			ScheduledBlocks: blocksByDevice[d.DeviceID],
 		}
 
 		newDevices[d.ResolverUID] = di
@@ -353,7 +272,6 @@ func (c *Cache) LightReload(database *db.DB) error {
 
 	c.mu.Lock()
 	c.devices = newDevices
-	c.profiles = newProfiles
 	c.lastLightReload = time.Now()
 	c.mu.Unlock()
 
@@ -361,7 +279,7 @@ func (c *Cache) LightReload(database *db.DB) error {
 	for _, blocks := range blocksByDevice {
 		totalBlocks += len(blocks)
 	}
-	logger.Info("lightweight reload complete: %d devices, %d profiles, %d scheduled blocks", len(newDevices), len(newProfiles), totalBlocks)
+	logger.Info("lightweight reload complete: %d devices, %d scheduled blocks", len(newDevices), totalBlocks)
 	return nil
 }
 
@@ -400,19 +318,15 @@ func (c *Cache) FullReload(database *db.DB) error {
 }
 
 // LoadForTest directly loads data into the cache for unit testing.
-func (c *Cache) LoadForTest(devices map[string]*DeviceInfo, profiles map[int64]*ProfileInfo, blocklists map[string]map[string]bool) {
+func (c *Cache) LoadForTest(devices map[string]*DeviceInfo, blocklists map[string]map[string]bool) {
 	if devices == nil {
 		devices = map[string]*DeviceInfo{}
-	}
-	if profiles == nil {
-		profiles = map[int64]*ProfileInfo{}
 	}
 	if blocklists == nil {
 		blocklists = map[string]map[string]bool{}
 	}
 	c.mu.Lock()
 	c.devices = devices
-	c.profiles = profiles
 	c.blocklistDomains = blocklists
 	c.mu.Unlock()
 }
