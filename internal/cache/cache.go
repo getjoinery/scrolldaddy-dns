@@ -127,36 +127,60 @@ func (c *Cache) Stats() CacheStats {
 	}
 }
 
-// LightReload reloads devices and all scheduled/always-on blocks with their rules from the DB.
-// Does NOT reload blocklist domains (use FullReload for that).
-//
-// All filtering policy now lives on block rows (sdb_scheduled_blocks). An always-on
-// block (IsAlwaysOn=true) replaces what used to be profile-level filters/services/rules.
-func (c *Cache) LightReload(database *db.DB) error {
-	deviceRows, err := database.LoadDevices()
-	if err != nil {
-		return fmt.Errorf("loading devices: %w", err)
+// LightReload reloads devices and all scheduled/always-on blocks from all DBs,
+// unioning them into the in-memory cache. Device UIDs are globally unique across
+// deployments, so the union is collision-free. Each DB's device IDs are scoped
+// to that DB to avoid cross-deployment integer collisions.
+func (c *Cache) LightReload(databases []*db.DB) error {
+	newDevices := make(map[string]*DeviceInfo)
+	totalBlocks := 0
+	for _, database := range databases {
+		partial, blocks, err := loadDevicesFromDB(database)
+		if err != nil {
+			return err
+		}
+		for uid, di := range partial {
+			newDevices[uid] = di
+		}
+		totalBlocks += blocks
 	}
 
-	// Load scheduled blocks and their rules (includes always-on blocks)
+	c.mu.Lock()
+	c.devices = newDevices
+	c.lastLightReload = time.Now()
+	c.mu.Unlock()
+
+	logger.Info("lightweight reload complete: %d devices, %d scheduled blocks", len(newDevices), totalBlocks)
+	return nil
+}
+
+// loadDevicesFromDB loads devices and their scheduled blocks from a single DB.
+// Returns (uid→DeviceInfo, totalBlocks, error).
+// Device IDs stay scoped to this DB — callers merge by UID, not by device ID.
+func loadDevicesFromDB(database *db.DB) (map[string]*DeviceInfo, int, error) {
+	deviceRows, err := database.LoadDevices()
+	if err != nil {
+		return nil, 0, fmt.Errorf("loading devices: %w", err)
+	}
+
 	blockRows, err := database.LoadScheduledBlocks()
 	if err != nil {
-		return fmt.Errorf("loading scheduled blocks: %w", err)
+		return nil, 0, fmt.Errorf("loading scheduled blocks: %w", err)
 	}
 
 	blockFilterRules, err := database.LoadScheduledBlockFilterRules()
 	if err != nil {
-		return fmt.Errorf("loading scheduled block filter rules: %w", err)
+		return nil, 0, fmt.Errorf("loading scheduled block filter rules: %w", err)
 	}
 
 	blockServiceRules, err := database.LoadScheduledBlockServiceRules()
 	if err != nil {
-		return fmt.Errorf("loading scheduled block service rules: %w", err)
+		return nil, 0, fmt.Errorf("loading scheduled block service rules: %w", err)
 	}
 
 	blockDomainRules, err := database.LoadScheduledBlockDomainRules()
 	if err != nil {
-		return fmt.Errorf("loading scheduled block domain rules: %w", err)
+		return nil, 0, fmt.Errorf("loading scheduled block domain rules: %w", err)
 	}
 
 	// Index scheduled block rules by block ID
@@ -173,7 +197,7 @@ func (c *Cache) LightReload(database *db.DB) error {
 		blockDomainsByID[r.BlockID] = append(blockDomainsByID[r.BlockID], r)
 	}
 
-	// Build scheduled blocks grouped by device ID
+	// Build scheduled blocks grouped by device ID (local to this DB)
 	blocksByDevice := map[int64][]ScheduledBlock{}
 	for _, b := range blockRows {
 		sb := ScheduledBlock{
@@ -249,16 +273,15 @@ func (c *Cache) LightReload(database *db.DB) error {
 		blocksByDevice[b.DeviceID] = append(blocksByDevice[b.DeviceID], sb)
 	}
 
-	// Build device map
-	newDevices := make(map[string]*DeviceInfo, len(deviceRows))
+	// Build device map keyed by resolver UID (globally unique)
+	devices := make(map[string]*DeviceInfo, len(deviceRows))
 	for _, d := range deviceRows {
 		loc, err := time.LoadLocation(d.Timezone)
 		if err != nil {
 			logger.Warn("device %d: invalid timezone %q, using UTC", d.DeviceID, d.Timezone)
 			loc = time.UTC
 		}
-
-		di := &DeviceInfo{
+		devices[d.ResolverUID] = &DeviceInfo{
 			DeviceID:        d.DeviceID,
 			ResolverUID:     d.ResolverUID,
 			IsActive:        d.IsActive,
@@ -266,54 +289,69 @@ func (c *Cache) LightReload(database *db.DB) error {
 			Timezone:        loc,
 			ScheduledBlocks: blocksByDevice[d.DeviceID],
 		}
-
-		newDevices[d.ResolverUID] = di
 	}
-
-	c.mu.Lock()
-	c.devices = newDevices
-	c.lastLightReload = time.Now()
-	c.mu.Unlock()
 
 	totalBlocks := 0
 	for _, blocks := range blocksByDevice {
 		totalBlocks += len(blocks)
 	}
-	logger.Info("lightweight reload complete: %d devices, %d scheduled blocks", len(newDevices), totalBlocks)
-	return nil
+	return devices, totalBlocks, nil
 }
 
-// FullReload reloads blocklist domains from the DB.
-// Skips the expensive table scan if the blocklist version in stg_settings is unchanged.
-func (c *Cache) FullReload(database *db.DB) error {
-	currentVersion := database.GetBlocklistVersion()
+// FullReload reloads blocklist domains from all DBs, unioning them.
+// Skips the expensive table scans if all DB blocklist versions are unchanged.
+// Both deployments share the same blocklist source, so the union is typically
+// a no-op (identical data), but merging is correct even when they diverge.
+func (c *Cache) FullReload(databases []*db.DB) error {
+	// Collect versions from each DB and build a composite key.
+	versions := make([]string, len(databases))
+	allHaveVersion := true
+	for i, database := range databases {
+		versions[i] = database.GetBlocklistVersion()
+		if versions[i] == "" {
+			allHaveVersion = false
+		}
+	}
+	compositeVersion := strings.Join(versions, "|")
 
 	c.mu.RLock()
 	lastVersion := c.lastBlocklistVersion
 	c.mu.RUnlock()
 
-	if currentVersion != "" && currentVersion == lastVersion {
-		logger.Debug("blocklist data unchanged (version=%q), skipping full reload", currentVersion)
+	if allHaveVersion && compositeVersion == lastVersion {
+		logger.Debug("blocklist data unchanged (version=%q), skipping full reload", compositeVersion)
 		return nil
 	}
 
-	newDomains, err := database.LoadBlocklistDomains()
-	if err != nil {
-		return fmt.Errorf("loading blocklist domains: %w", err)
+	// Load and union domains from all DBs.
+	mergedDomains := map[string]map[string]bool{}
+	for _, database := range databases {
+		newDomains, err := database.LoadBlocklistDomains()
+		if err != nil {
+			return fmt.Errorf("loading blocklist domains: %w", err)
+		}
+		for category, domains := range newDomains {
+			if mergedDomains[category] == nil {
+				mergedDomains[category] = map[string]bool{}
+			}
+			for domain, v := range domains {
+				mergedDomains[category][domain] = v
+			}
+		}
 	}
 
 	totalDomains := 0
-	for _, s := range newDomains {
+	for _, s := range mergedDomains {
 		totalDomains += len(s)
 	}
 
 	c.mu.Lock()
-	c.blocklistDomains = newDomains
+	c.blocklistDomains = mergedDomains
 	c.lastFullReload = time.Now()
-	c.lastBlocklistVersion = currentVersion
+	c.lastBlocklistVersion = compositeVersion
 	c.mu.Unlock()
 
-	logger.Info("full reload complete: %d blocklist domains across %d categories", totalDomains, len(newDomains))
+	logger.Info("full reload complete: %d blocklist domains across %d categories", totalDomains, len(mergedDomains))
 	return nil
 }
 

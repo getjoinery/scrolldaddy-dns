@@ -58,13 +58,17 @@ type ScheduledBlockRuleRow struct {
 	Action  int
 }
 
-// Connect opens and verifies a PostgreSQL connection.
+// Connect opens and verifies a PostgreSQL connection using discrete parameters.
 func Connect(host, port, dbname, user, password string) (*DB, error) {
-	connStr := fmt.Sprintf(
+	return ConnectURL(fmt.Sprintf(
 		"host=%s port=%s dbname=%s user=%s password=%s sslmode=disable",
 		host, port, dbname, user, password,
-	)
-	conn, err := sql.Open("postgres", connStr)
+	))
+}
+
+// ConnectURL opens and verifies a PostgreSQL connection from a DSN or URL string.
+func ConnectURL(dsn string) (*DB, error) {
+	conn, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -281,12 +285,12 @@ func (db *DB) LoadBlocklistDomains() (map[string]map[string]bool, error) {
 	return result, rows.Err()
 }
 
-// GetBlocklistVersion returns the current scrolldaddy_blocklist_version from stg_settings.
+// GetBlocklistVersion returns the current dns_filtering_blocklist_version from stg_settings.
 // Returns an empty string if the setting does not exist or the query fails.
 func (db *DB) GetBlocklistVersion() string {
 	var version string
 	err := db.conn.QueryRow(
-		`SELECT stg_value FROM stg_settings WHERE stg_name = 'scrolldaddy_blocklist_version' LIMIT 1`,
+		`SELECT stg_value FROM stg_settings WHERE stg_name = 'dns_filtering_blocklist_version' LIMIT 1`,
 	).Scan(&version)
 	if err != nil {
 		return ""

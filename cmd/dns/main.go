@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,7 +39,9 @@ func main() {
 	}
 	logger.SetLevel(cfg.LogLevel)
 	logger.Info("starting ScrollDaddy DNS service v%s", version)
-	logger.Info("database: %s@%s:%s/%s", cfg.DBUser, cfg.DBHost, cfg.DBPort, cfg.DBName)
+	for i, dsn := range cfg.JoineryDBURLs {
+		logger.Info("database[%d]: %s", i, maskDSN(dsn))
+	}
 
 	// 2. Load feature config (needed early to know fail_mode before DB connect)
 	fc, err := config.LoadFeatureConfig(cfg.ConfigFile)
@@ -134,51 +137,69 @@ func main() {
 	}
 }
 
-// connectAndLoad connects to the database, validates schema, performs the
-// initial cache load, starts the reload loops, and disables passthrough mode.
-// Retries indefinitely on failure. Called synchronously (fail_closed) or as
-// a goroutine (fail_open). Both paths log errors on every retry so failures
-// are visible in the error log regardless of fail_mode.
+// connectAndLoad connects to all configured databases, validates schemas,
+// performs the initial cache load, starts the reload loops, and disables
+// passthrough mode. Retries indefinitely on failure. Called synchronously
+// (fail_closed) or as a goroutine (fail_open).
 func connectAndLoad(res *resolver.Resolver, h *doh.Handler, cfg *config.Config, c *cache.Cache, dc *dnscache.Cache, reloadTrigger chan struct{}) {
-	var database *db.DB
-	var err error
+	databases := make([]*db.DB, 0, len(cfg.JoineryDBURLs))
 
 	for {
-		database, err = db.Connect(cfg.DBHost, cfg.DBPort, cfg.DBName, cfg.DBUser, cfg.DBPassword)
-		if err != nil {
-			logger.Error("DB connection failed: %v — retrying in 5s", err)
+		// Connect to every configured DB; close any already-opened on partial failure.
+		var failed bool
+		databases = databases[:0]
+		for i, dsn := range cfg.JoineryDBURLs {
+			d, err := db.ConnectURL(dsn)
+			if err != nil {
+				logger.Error("DB[%d] connection failed: %v — retrying all in 5s", i, err)
+				for _, open := range databases {
+					open.Close()
+				}
+				failed = true
+				break
+			}
+			logger.Info("DB[%d] connected (%s)", i, maskDSN(dsn))
+			if err = d.ValidateSchema(); err != nil {
+				logger.Error("DB[%d] schema validation failed: %v — retrying all in 5s", i, err)
+				d.Close()
+				for _, open := range databases {
+					open.Close()
+				}
+				failed = true
+				break
+			}
+			logger.Info("DB[%d] schema validation passed", i)
+			databases = append(databases, d)
+		}
+		if failed {
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		logger.Info("connected to PostgreSQL: %s@%s:%s/%s", cfg.DBUser, cfg.DBHost, cfg.DBPort, cfg.DBName)
 
-		if err = database.ValidateSchema(); err != nil {
-			logger.Error("schema validation failed: %v — retrying in 5s", err)
-			database.Close()
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		logger.Info("schema validation passed")
-
-		if err = c.LightReload(database); err != nil {
+		if err := c.LightReload(databases); err != nil {
 			logger.Error("initial light reload failed: %v — retrying in 5s", err)
-			database.Close()
+			for _, d := range databases {
+				d.Close()
+			}
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		if err = c.FullReload(database); err != nil {
+		if err := c.FullReload(databases); err != nil {
 			logger.Error("initial full reload failed: %v — retrying in 5s", err)
-			database.Close()
+			for _, d := range databases {
+				d.Close()
+			}
 			time.Sleep(5 * time.Second)
 			continue
 		}
 		break
 	}
 
-	logger.Info("initial cache load complete")
+	logger.Info("initial cache load complete (%d database(s))", len(databases))
 
-	// Wire database into the DoH handler for /health.
-	h.SetDatabase(database)
+	// Wire the first database into the DoH handler for /health.
+	// A future enhancement could check all DBs; for now one ping is sufficient.
+	h.SetDatabase(databases[0])
 
 	// Flush the DNS response cache: any responses cached during passthrough
 	// were unfiltered and should not persist now that filtering is active.
@@ -191,16 +212,16 @@ func connectAndLoad(res *resolver.Resolver, h *doh.Handler, cfg *config.Config, 
 		res.SetPassthrough(false)
 	}
 
-	go lightReloadLoop(c, database, cfg.ReloadInterval)
-	go fullReloadLoop(c, database, cfg.BlocklistReloadInterval, reloadTrigger)
+	go lightReloadLoop(c, databases, cfg.ReloadInterval)
+	go fullReloadLoop(c, databases, cfg.BlocklistReloadInterval, reloadTrigger)
 }
 
 // lightReloadLoop reloads devices, profiles, filters, and rules every interval seconds.
-func lightReloadLoop(c *cache.Cache, database *db.DB, intervalSecs int) {
+func lightReloadLoop(c *cache.Cache, databases []*db.DB, intervalSecs int) {
 	ticker := time.NewTicker(time.Duration(intervalSecs) * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		if err := c.LightReload(database); err != nil {
+		if err := c.LightReload(databases); err != nil {
 			logger.Error("light reload failed: %v -- serving from cached data", err)
 		}
 	}
@@ -208,26 +229,49 @@ func lightReloadLoop(c *cache.Cache, database *db.DB, intervalSecs int) {
 
 // fullReloadLoop reloads blocklist domains every interval seconds,
 // and also on demand via the reloadTrigger channel.
-func fullReloadLoop(c *cache.Cache, database *db.DB, intervalSecs int, trigger <-chan struct{}) {
+func fullReloadLoop(c *cache.Cache, databases []*db.DB, intervalSecs int, trigger <-chan struct{}) {
 	ticker := time.NewTicker(time.Duration(intervalSecs) * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			doFullReload(c, database)
+			doFullReload(c, databases)
 		case <-trigger:
 			logger.Info("on-demand reload triggered")
-			doFullReload(c, database)
+			doFullReload(c, databases)
 			// Also do a light reload so device/profile changes are picked up immediately
-			if err := c.LightReload(database); err != nil {
+			if err := c.LightReload(databases); err != nil {
 				logger.Error("on-demand light reload failed: %v", err)
 			}
 		}
 	}
 }
 
-func doFullReload(c *cache.Cache, database *db.DB) {
-	if err := c.FullReload(database); err != nil {
+func doFullReload(c *cache.Cache, databases []*db.DB) {
+	if err := c.FullReload(databases); err != nil {
 		logger.Error("full reload failed: %v -- serving from cached data", err)
 	}
+}
+
+// maskDSN redacts the password from a DSN or URL for safe logging.
+func maskDSN(dsn string) string {
+	// Handle URL form: postgresql://user:password@host/db
+	if i := strings.Index(dsn, "://"); i >= 0 {
+		rest := dsn[i+3:]
+		if at := strings.Index(rest, "@"); at >= 0 {
+			userinfo := rest[:at]
+			if colon := strings.Index(userinfo, ":"); colon >= 0 {
+				return dsn[:i+3] + userinfo[:colon+1] + "***" + rest[at:]
+			}
+		}
+		return dsn
+	}
+	// Handle key=value DSN form: host=... password=xxx ...
+	parts := strings.Fields(dsn)
+	for i, p := range parts {
+		if strings.HasPrefix(p, "password=") {
+			parts[i] = "password=***"
+		}
+	}
+	return strings.Join(parts, " ")
 }

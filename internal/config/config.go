@@ -5,14 +5,14 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
-	DBHost     string
-	DBPort     string
-	DBName     string
-	DBUser     string
-	DBPassword string
+	// JoineryDBURLs is the list of PostgreSQL DSNs to read from.
+	// Populated from SCD_JOINERY_DB_URLS (comma-separated) or constructed from
+	// the legacy SCD_DB_* vars when SCD_JOINERY_DB_URLS is not set.
+	JoineryDBURLs []string
 
 	DoHPort       int
 	DoTPort       int
@@ -139,12 +139,36 @@ func MergeEnvOverrides(fc *FeatureConfig) {
 }
 
 func Load() (*Config, error) {
+	var dbURLs []string
+	if raw := os.Getenv("SCD_JOINERY_DB_URLS"); raw != "" {
+		for _, u := range strings.Split(raw, ",") {
+			if u = strings.TrimSpace(u); u != "" {
+				dbURLs = append(dbURLs, u)
+			}
+		}
+	}
+
+	// Backward compat: construct a single DSN from legacy SCD_DB_* vars.
+	if len(dbURLs) == 0 {
+		host := getEnv("SCD_DB_HOST", "localhost")
+		port := getEnv("SCD_DB_PORT", "5432")
+		name := getEnv("SCD_DB_NAME", "")
+		user := getEnv("SCD_DB_USER", "postgres")
+		pass := getEnv("SCD_DB_PASSWORD", "")
+		if name == "" {
+			return nil, fmt.Errorf("SCD_JOINERY_DB_URLS or SCD_DB_NAME is required")
+		}
+		if pass == "" {
+			return nil, fmt.Errorf("SCD_JOINERY_DB_URLS or SCD_DB_PASSWORD is required")
+		}
+		dbURLs = []string{fmt.Sprintf(
+			"host=%s port=%s dbname=%s user=%s password=%s sslmode=disable",
+			host, port, name, user, pass,
+		)}
+	}
+
 	cfg := &Config{
-		DBHost:                  getEnv("SCD_DB_HOST", "localhost"),
-		DBPort:                  getEnv("SCD_DB_PORT", "5432"),
-		DBName:                  getEnv("SCD_DB_NAME", ""),
-		DBUser:                  getEnv("SCD_DB_USER", "postgres"),
-		DBPassword:              getEnv("SCD_DB_PASSWORD", ""),
+		JoineryDBURLs:           dbURLs,
 		DoHPort:                 getEnvInt("SCD_DOH_PORT", 8053),
 		DoTPort:                 getEnvInt("SCD_DOT_PORT", 853),
 		DoTCertFile:             getEnv("SCD_DOT_CERT_FILE", ""),
@@ -160,13 +184,6 @@ func Load() (*Config, error) {
 		LogFile:                 getEnv("SCD_LOG_FILE", "stdout"),
 		APIKey:                  getEnv("SCD_API_KEY", ""),
 		PeerURL:                 getEnv("SCD_PEER_URL", ""),
-	}
-
-	if cfg.DBName == "" {
-		return nil, fmt.Errorf("SCD_DB_NAME is required")
-	}
-	if cfg.DBPassword == "" {
-		return nil, fmt.Errorf("SCD_DB_PASSWORD is required")
 	}
 
 	return cfg, nil
